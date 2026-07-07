@@ -1,5 +1,7 @@
 # FluxInfer
 
+[![CI](https://github.com/federicobarrosgiuffrida/fluxinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/federicobarrosgiuffrida/fluxinfer/actions/workflows/ci.yml)
+
 FluxInfer is a multiplatform wrapper/autotuner for [llama.cpp](https://github.com/ggml-org/llama.cpp).
 It detects your hardware, benchmarks a small number of `llama-bench`
 configurations, picks the best one for a given `.gguf` model, saves it as a
@@ -440,14 +442,11 @@ model. See `compute_model_info()` in
   missing at `run`/`serve` time, version/flag validation is skipped with a
   warning.
 - No GUI; no Electron; CLI-only.
-- The POSIX process runner (`src/process/process_runner_posix.cpp`) has a
-  GitHub Actions job configured to build and test it on Ubuntu on every
-  push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)), but
-  since this repository has no git remote yet, that workflow has not
-  actually executed anywhere; it has only been syntax-checked locally.
-  Treat it as unverified until CI has actually run green at least once.
-  Not run on macOS; a macOS CI job will be added once that's been verified
-  rather than assumed.
+- The POSIX process runner (`src/process/process_runner_posix.cpp`) builds
+  and passes the full test suite on Ubuntu via GitHub Actions (see
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and the badge
+  above) — it's no longer just syntax-checked. Not run on macOS; a macOS CI
+  job will be added once that's been verified rather than assumed.
 
 ## Roadmap
 

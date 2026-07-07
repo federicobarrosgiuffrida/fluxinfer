@@ -1,0 +1,2 @@
+Reserved for custom CMake modules (find-modules, toolchain helpers). Empty
+for now: this MVP doesn't need any beyond what CMake ships with.

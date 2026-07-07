@@ -1,0 +1,8 @@
+This directory is an optional location for a llama.cpp checkout (e.g. as a
+git submodule: `git submodule add https://github.com/ggml-org/llama.cpp external/llama.cpp`).
+
+FluxInfer does NOT build or link against llama.cpp source. It only locates
+and invokes prebuilt llama-bench / llama-cli / llama-server binaries at
+runtime. If you keep a llama.cpp checkout here and build it yourself, point
+FluxInfer at its output directory with --llama-dir or the FLUXINFER_LLAMA_DIR
+environment variable (see README.md).

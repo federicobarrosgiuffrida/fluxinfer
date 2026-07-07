@@ -20,8 +20,9 @@ reproducible repeated-measurement comparison report, and the four core
 subcommands (`inspect`, `tune`, `run`, `serve`). It has not been used in
 production. Interfaces (CLI flags, profile JSON schema) may still change.
 
-**Tested on:** one machine, one model, one GPU — Qwen3.5-9B (dense, Q8_0)
-on an NVIDIA RTX 5060 8GB, Windows. See
+**Tested on:** one machine, two models, one GPU — Qwen3.5-9B (dense, Q8_0)
+on an NVIDIA RTX 5060 8GB, Windows and Qwythos-9B-Claude-Mythos-5-1M-MTP-Q8_0.
+See
 [`docs/benchmarks/`](docs/benchmarks/) for the real numbers, including a
 head-to-head against LM Studio's own default auto-offload on the same
 hardware. **This is one data point, not a general performance guarantee.**

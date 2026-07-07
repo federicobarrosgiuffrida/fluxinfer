@@ -13,7 +13,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        # No -G here: let CMake pick whatever Visual Studio generator the
+        # runner image actually has. Hardcoding a version (e.g. "Visual
+        # Studio 17 2022") breaks silently whenever GitHub updates the
+        # windows-latest image to a newer VS release with a different
+        # generator name.
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release -j 4

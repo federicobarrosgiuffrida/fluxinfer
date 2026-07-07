@@ -1,10 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Statically link the MSVC runtime so a distributed fluxinfer.exe runs on a
+# machine without the Visual C++ Redistributable installed -- important
+# for handing out a prebuilt release binary rather than requiring everyone
+# to build from source. Must be set before project() to take effect.
+cmake_policy(SET CMP0091 NEW)
+
 project(fluxinfer
-    VERSION 0.1.0
+    VERSION 0.3.1
     DESCRIPTION "Multiplatform autotuner/wrapper for llama.cpp"
     LANGUAGES CXX
 )
+
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

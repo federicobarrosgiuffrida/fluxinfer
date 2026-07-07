@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  windows:
+    name: Build Windows release binary
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Release, static CRT, no tests)
+        run: cmake -S . -B build -A x64 -DFLUXINFER_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dest = "fluxinfer-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item build/Release/fluxinfer.exe $dest/
+          Copy-Item README.md $dest/
+          Copy-Item LICENSE $dest/
+          Compress-Archive -Path $dest/* -DestinationPath "$dest.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fluxinfer-windows-x64
+          path: fluxinfer-*-windows-x64.zip
+
+  ubuntu:
+    name: Build Ubuntu release binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Configure (Release, no tests)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DFLUXINFER_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Package
+        run: |
+          dest="fluxinfer-${{ github.ref_name }}-linux-x64"
+          mkdir -p "$dest"
+          cp build/fluxinfer "$dest/"
+          cp README.md LICENSE "$dest/"
+          tar czf "$dest.tar.gz" "$dest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fluxinfer-linux-x64
+          path: fluxinfer-*-linux-x64.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs: [windows, ubuntu]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "FluxInfer ${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*

@@ -60,6 +60,7 @@ json to_json(const Profile& profile) {
         {"batch_size", profile.best_config.batch_size},
         {"ubatch_size", profile.best_config.ubatch_size},
         {"kv_cache_type", profile.best_config.kv_cache_type ? json(*profile.best_config.kv_cache_type) : json(nullptr)},
+        {"context_length", profile.best_config.context_length},
     };
 
     j["results"] = {
@@ -111,6 +112,9 @@ std::optional<Profile> profile_from_json(const json& j, std::string* error) {
         if (best.contains("kv_cache_type") && !best["kv_cache_type"].is_null()) {
             profile.best_config.kv_cache_type = best["kv_cache_type"].get<std::string>();
         }
+        // value() default (0) keeps older profiles saved before this field
+        // existed loadable: they simply behave as before (no explicit -c).
+        profile.best_config.context_length = best.value("context_length", std::uint64_t{0});
 
         const auto& results = j.at("results");
         profile.results.prompt_tps = results.at("prompt_tps").get<double>();

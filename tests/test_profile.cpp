@@ -32,6 +32,7 @@ Profile make_sample_profile() {
     profile.best_config.batch_size = 512;
     profile.best_config.ubatch_size = 256;
     profile.best_config.kv_cache_type = "q8_0";
+    profile.best_config.context_length = 4096;
 
     profile.results.prompt_tps = 1200.5;
     profile.results.generation_tps = 18.7;
@@ -78,7 +79,19 @@ TEST_CASE("profile JSON round-trips through to_json/profile_from_json", "[profil
     CHECK(parsed->best_config.threads == original.best_config.threads);
     CHECK(parsed->best_config.gpu_layers == original.best_config.gpu_layers);
     CHECK(parsed->best_config.kv_cache_type == original.best_config.kv_cache_type);
+    CHECK(parsed->best_config.context_length == original.best_config.context_length);
     CHECK(parsed->results.score == Catch::Approx(original.results.score));
+}
+
+TEST_CASE("profile_from_json defaults context_length to 0 for a profile saved before the field existed",
+          "[profile][compat]") {
+    Profile original = make_sample_profile();
+    nlohmann::json json = to_json(original);
+    json["best_config"].erase("context_length"); // simulate an older, pre-context_length profile file
+
+    std::optional<Profile> parsed = profile_from_json(json);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->best_config.context_length == 0);
 }
 
 TEST_CASE("profile JSON round-trips a null kv_cache_type", "[profile]") {

@@ -32,6 +32,28 @@ struct TunerOptions {
     unsigned prompt_tokens_for_bench = 512; // -p
     unsigned gen_tokens_for_bench = 128;    // -n
 
+    // The context size `fluxinfer run`/`serve` will actually launch
+    // llama-cli/llama-server with (`-c`/`--ctx-size`). llama-bench has no
+    // equivalent context-size flag of its own -- it only allocates as much
+    // KV cache as `-p`/`-n` need, typically a few hundred tokens -- so
+    // without deliberately accounting for this, a config benchmarked at a
+    // tiny effective context could behave very differently (slower, or
+    // even OOM) once actually run at a real context size, since a larger
+    // KV cache competes with model weights for the same VRAM budget. To
+    // keep tuning representative of real usage, every benchmark candidate
+    // is run with `-d context_length` (llama-bench's "pre-fill this many
+    // tokens of KV cache before measuring" flag), which allocates a KV
+    // cache of comparable size to what `-c context_length` would at run
+    // time. context_length is also persisted into the saved profile and
+    // reused as `-c` by `run`/`serve`, so the benchmarked and served
+    // configurations are consistent. Found via a real regression report:
+    // a config tuned without this reasoning performed worse in practice
+    // than in the benchmark once run with llama.cpp's own default context
+    // (0 = the model's full native training context, which can be
+    // enormous -- e.g. 262144+ tokens -- and was silently reserving far
+    // more KV-cache VRAM at run time than the benchmark ever exercised).
+    unsigned context_length = 4096;
+
     // Internal llama-bench repetitions (`-r`) per search-stage candidate,
     // run within a single warm process/model-load. The *median* sample is
     // used for scoring rather than llama-bench's own average, which is

@@ -135,6 +135,7 @@ it.
 ```bash
 fluxinfer inspect
 fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--llama-dir DIR] [--profiles-dir DIR]
+                                    [--context N] [--search-repetitions N]
                                     [--compare-repeats N] [--warmup-runs N] [--report-out FILE]
 fluxinfer run   path/to/model.gguf [-- extra llama-cli args]
 fluxinfer serve path/to/model.gguf [--host HOST] [--port PORT] [-- extra llama-server args]
@@ -226,6 +227,29 @@ output) is saved as the profile. See [Scoring](#scoring) and
 (default 3); higher is more resistant to noisy single-sample decisions at
 some extra search time (repetitions reuse the same model load, so the
 added cost is just N× the compute passes, not N× the load time).
+
+#### Context size (`--context`)
+
+`llama-bench` has no context-size flag of its own — it only allocates as
+much KV cache as `-p`/`-n` need for the test (a few hundred tokens). But
+`llama-cli`/`llama-server` (used by `run`/`serve`) *do* have one
+(`-c`/`--ctx-size`), and if it's left unset they default to **the model's
+full native training context** — which for a modern long-context model can
+be 262144 tokens or more. Left unaddressed, this is a real train/serve
+mismatch: a config benchmarked with a tiny effective context could behave
+very differently once actually run with a much larger one, since KV cache
+size competes with GPU-offloaded model layers for the same VRAM budget.
+This was found via a real regression report (a tuned config performing
+*worse* in practice than in the benchmark) rather than found by inspection.
+
+FluxInfer now tunes and serves at a single, explicit context size,
+consistent between the two phases: `--context N` (default 4096) is passed
+to `llama-bench` as `-d N` (its "pre-fill this many tokens of KV cache
+before measuring" flag — the closest equivalent to `-c` it has) during
+`tune`, is saved into the profile, and is passed as `-c N` to
+`llama-cli`/`llama-server` by `run`/`serve`. Profiles saved before this
+field existed have `context_length == 0` and fall back to the old
+behavior (no explicit `-c`) rather than guessing a value.
 
 #### Model metadata discovery
 
@@ -373,7 +397,7 @@ configurable with `--profiles-dir`), matching this schema:
   "model": { "path": "...", "size_bytes": 0, "fingerprint": "..." },
   "hardware": { "cpu": "...", "logical_threads": 0, "ram_bytes": 0, "gpu": "...", "vram_bytes": 0 },
   "llama": { "version": "...", "binary_path": "...", "supported_flags": [] },
-  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null },
+  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null, "context_length": 4096 },
   "results": { "prompt_tps": 0.0, "generation_tps": 0.0, "duration_ms": 0, "score": 0.0 }
 }
 ```

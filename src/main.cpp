@@ -154,8 +154,8 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 // fluxinfer tune <model.gguf>
 // ---------------------------------------------------------------------
 int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt, const std::string& profiles_dir_opt,
-             unsigned timeout_seconds, unsigned search_repetitions, unsigned compare_repeats, unsigned warmup_runs,
-             const std::string& report_out_opt) {
+             unsigned timeout_seconds, unsigned search_repetitions, unsigned context_length, unsigned compare_repeats,
+             unsigned warmup_runs, const std::string& report_out_opt) {
     const std::filesystem::path model_path(model_path_str);
 
     std::string model_error;
@@ -209,6 +209,10 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     options.real_layer_count = gguf.valid ? gguf.metadata.block_count : std::nullopt;
     options.per_run_timeout = std::chrono::seconds(timeout_seconds);
     options.search_repetitions = std::max(1u, search_repetitions);
+    options.context_length = context_length;
+    std::cout << "Tuning and serving at context size " << context_length
+              << " tokens (override with --context; this is what llama-bench is benchmarked against via -d, and what "
+                 "run/serve will launch llama-cli/llama-server with via -c).\n";
     options.on_result = [](const tuner::BenchmarkResult& result) {
         std::cout << "  [" << result.config.label << "] ";
         if (result.oom) {
@@ -245,6 +249,7 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     profile.best_config.batch_size = best.config.batch_size;
     profile.best_config.ubatch_size = best.config.ubatch_size;
     profile.best_config.kv_cache_type = best.config.kv_cache_type;
+    profile.best_config.context_length = context_length;
     profile.results.prompt_tps = best.prompt_tokens_per_second;
     profile.results.generation_tps = best.generation_tokens_per_second;
     profile.results.duration_ms = best.duration.count();
@@ -360,6 +365,16 @@ std::vector<std::string> build_config_arguments(const profiles::Profile& profile
     add_if_supported("--n-gpu-layers", "-ngl", std::to_string(profile.best_config.gpu_layers));
     add_if_supported("--batch-size", "-b", std::to_string(profile.best_config.batch_size));
     add_if_supported("--ubatch-size", "-ub", std::to_string(profile.best_config.ubatch_size));
+    // Match the context size this config was actually benchmarked at (see
+    // TunerOptions::context_length): without this, llama-cli/llama-server
+    // fall back to their own default of the model's full native context,
+    // which can be far larger than what was tested and silently changes
+    // real-world VRAM usage and throughput. context_length == 0 means an
+    // older profile saved before this field existed; leave -c unset in
+    // that case rather than guessing.
+    if (profile.best_config.context_length > 0) {
+        add_if_supported("--ctx-size", "-c", std::to_string(profile.best_config.context_length));
+    }
     if (profile.best_config.kv_cache_type) {
         if (llama::supports_flag(supported_flags, "--cache-type-k")) {
             args.push_back("-ctk");
@@ -481,6 +496,7 @@ int main(int argc, char** argv) {
     std::string tune_model;
     unsigned tune_timeout_seconds = 60;
     unsigned search_repetitions = 3;
+    unsigned context_length = 4096;
     unsigned compare_repeats = 0;
     unsigned warmup_runs = 1;
     std::string report_out;
@@ -493,6 +509,12 @@ int main(int argc, char** argv) {
                       "llama-bench repetitions per search-stage candidate (median used for scoring; more resists "
                       "noisy single-sample decisions, at some extra time cost)")
         ->default_val(3);
+    tune_cmd
+        ->add_option("--context", context_length,
+                      "Context size (tokens) to tune and serve at. Benchmarked via llama-bench's KV-cache pre-fill "
+                      "(-d) and later launched identically by run/serve (-c), so the benchmark reflects real usage. "
+                      "Larger contexts reserve more VRAM for KV cache, competing with GPU-offloaded layers.")
+        ->default_val(4096);
     tune_cmd
         ->add_option("--compare-repeats", compare_repeats,
                       "After tuning, re-benchmark the baseline and selected configs this many times each and print a "
@@ -531,7 +553,7 @@ int main(int argc, char** argv) {
     }
     if (*tune_cmd) {
         return cmd_tune(tune_model, llama_dir_opt, profiles_dir_opt, tune_timeout_seconds, search_repetitions,
-                         compare_repeats, warmup_runs, report_out);
+                         context_length, compare_repeats, warmup_runs, report_out);
     }
     if (*run_cmd) {
         return cmd_run(run_model, llama_dir_opt, profiles_dir_opt, run_extra_args);

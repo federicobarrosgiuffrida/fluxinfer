@@ -36,6 +36,15 @@ struct BestConfig {
     unsigned batch_size = 0;
     unsigned ubatch_size = 0;
     std::optional<std::string> kv_cache_type;
+
+    // The context size (`-c`/`--ctx-size`) this config was benchmarked
+    // with (via llama-bench's `-d` pre-fill) and that `run`/`serve` will
+    // launch llama-cli/llama-server with. 0 means "not recorded" (a
+    // profile saved before this field existed) -- run/serve leave `-c`
+    // unset in that case, i.e. the old behaviour of falling back to
+    // llama.cpp's own default (which is the model's full native context,
+    // not necessarily what was actually benchmarked).
+    std::uint64_t context_length = 0;
 };
 
 struct ProfileResults {

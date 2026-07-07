@@ -43,6 +43,11 @@ std::vector<std::string> Tuner::build_arguments(const TuneConfig& config, unsign
 
     add_if_supported(args, options_.supported_flags, "--n-prompt", "-p", std::to_string(options_.prompt_tokens_for_bench));
     add_if_supported(args, options_.supported_flags, "--n-gen", "-n", std::to_string(options_.gen_tokens_for_bench));
+    // llama-bench has no context-size flag of its own; -d pre-fills this
+    // many tokens of KV cache before measuring, which allocates a KV cache
+    // comparable in size to what `-c context_length` would at run time --
+    // see TunerOptions::context_length for why this matters.
+    add_if_supported(args, options_.supported_flags, "--n-depth", "-d", std::to_string(options_.context_length));
     add_if_supported(args, options_.supported_flags, "--threads", "-t", std::to_string(config.threads));
     add_if_supported(args, options_.supported_flags, "--n-gpu-layers", "-ngl", std::to_string(config.gpu_layers));
     add_if_supported(args, options_.supported_flags, "--batch-size", "-b", std::to_string(config.batch_size));

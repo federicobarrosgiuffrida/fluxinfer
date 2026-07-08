@@ -480,11 +480,18 @@ model. See `compute_model_info()` in
 0.2   benchmark parser + profiles
 0.3   automatic tuning
 0.3.1 real GGUF metadata discovery + reproducible benchmark comparison   <- current
-0.4   MoE activation profiling
-0.5   static expert placement
-0.6   dynamic GPU expert cache
-0.7   predictive expert prefetch
+0.4   static MoE expert-layer placement search (--n-cpu-moe as a tuned dimension)
+0.5   informed layer placement from offline expert-activation profiling (Linux/eBPF, opt-in)
+0.6   orchestration for a dynamic GPU expert cache, if/when one exists upstream
 ```
 
 Everything through `0.3.1` exists in an initial form; `0.4` onward is not
-implemented.
+implemented. `0.4`–`0.6` were reordered and re-scoped from the original
+plan after dedicated research — see
+[`docs/moe-vram-cache-research.md`](docs/moe-vram-cache-research.md) for
+the full investigation, what's realistic without touching llama.cpp,
+what would require forking it, and why. In short: real per-individual-
+expert dynamic caching (the biggest win, ~10x in early third-party
+reports) requires changes inside llama.cpp's backend scheduler that don't
+exist upstream yet, so it's listed as orchestration-readiness, not
+something FluxInfer will implement itself.

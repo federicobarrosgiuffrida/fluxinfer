@@ -168,6 +168,105 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 }
 
 // ---------------------------------------------------------------------
+// fluxinfer doctor
+// ---------------------------------------------------------------------
+// Answers, in one place, the questions that come up when something does
+// not work: which binaries am I actually using, does that build support
+// the flags FluxInfer wants to tune, and does it see the GPU at all. All
+// of this was already available piecemeal (inspect, --help probing, a
+// failed run's error text); the value here is having it in one output that
+// can be pasted into a bug report.
+int cmd_doctor(const std::string& llama_dir_opt) {
+    const hardware::HardwareInfo hw = hardware::probe_hardware();
+
+    std::cout << "Hardware:\n";
+    std::cout << "  CPU: " << hw.cpu.name << " (" << hw.cpu.physical_cores << " physical / " << hw.cpu.logical_threads
+              << " logical)\n";
+    std::cout << "  RAM: " << format_gib(hw.memory.available_bytes) << " available of " << format_gib(hw.memory.total_bytes)
+              << "\n";
+    if (hw.gpu.available) {
+        print_gpu(hw.gpu, "  ");
+        for (std::size_t i = 1; i < hw.gpus.size(); ++i) {
+            std::cout << "  --- additional device (not used for tuning) ---\n";
+            print_gpu(hw.gpus[i], "  ");
+        }
+    } else {
+        std::cout << "  GPU: not available (" << hw.gpu.unavailable_reason << ")\n";
+    }
+    std::cout << "\n";
+
+    llama::LlamaLocator locator(resolve_llama_dir(llama_dir_opt));
+    llama::LlamaBinaries binaries = locator.locate();
+
+    std::cout << "llama.cpp binaries:\n";
+    auto print_binary = [](const char* name, const std::optional<std::filesystem::path>& path) {
+        if (path) {
+            std::cout << "  " << name << ": " << path->string() << "\n";
+        } else {
+            std::cout << "  " << name << ": NOT FOUND\n";
+        }
+    };
+    print_binary("llama-bench", binaries.llama_bench);
+    print_binary("llama-cli", binaries.llama_cli);
+    print_binary("llama-server", binaries.llama_server);
+
+    if (!binaries.llama_bench) {
+        std::cout << "\nllama-bench is required for `tune`. Point FluxInfer at a llama.cpp build with --llama-dir, the\n"
+                     "FLUXINFER_LLAMA_DIR environment variable, or by putting the binaries on PATH.\n";
+        return 1;
+    }
+
+    std::cout << "  version: " << llama::detect_llama_version(*binaries.llama_bench) << "\n\n";
+
+    // Flags FluxInfer tunes or replays. A missing one is not an error: the
+    // corresponding stage is skipped. Saying so explicitly beats leaving
+    // the operator to wonder why a search dimension never appeared.
+    const std::set<std::string> flags = llama::detect_supported_flags(*binaries.llama_bench);
+    struct FlagCheck {
+        const char* flag;
+        const char* purpose;
+    };
+    const std::vector<FlagCheck> checks = {
+        {"--n-gpu-layers", "offload search (dense models)"},
+        {"--n-cpu-moe", "expert placement search (MoE models)"},
+        {"--n-depth", "benchmarking at the context size run/serve will use"},
+        {"--cache-type-k", "KV cache quantization"},
+        {"--cache-type-v", "KV cache quantization"},
+        {"--no-warmup", "warmup control in the comparison report"},
+    };
+    std::cout << "llama-bench capabilities:\n";
+    for (const FlagCheck& check : checks) {
+        const bool supported = llama::supports_flag(flags, check.flag);
+        std::cout << "  " << (supported ? "[yes] " : "[no ] ") << check.flag << " -- " << check.purpose << "\n";
+    }
+
+    std::cout << "\nGPU visibility of this build:\n";
+    if (!hw.gpu.available) {
+        std::cout << "  skipped: no NVIDIA GPU detected on this machine.\n";
+    } else {
+        // A CUDA-enabled llama.cpp lists its devices in --help output; a
+        // CPU-only build does not. This is a heuristic reading of text
+        // llama.cpp is free to change, so an inconclusive answer is
+        // reported as such rather than as a failure.
+        llama::LlamaRunResult help =
+            llama::run_llama_binary(*binaries.llama_bench, {"--help"}, std::chrono::seconds(20));
+        const std::string output = help.stdout_data + help.stderr_data;
+        const bool mentions_devices = output.find("CUDA") != std::string::npos ||
+                                       output.find("available devices") != std::string::npos ||
+                                       output.find("Device ") != std::string::npos;
+        if (mentions_devices) {
+            std::cout << "  llama-bench reports CUDA device support.\n";
+        } else {
+            std::cout << "  inconclusive: llama-bench's help output does not mention CUDA devices. If tuning only ever\n"
+                         "  produces CPU-speed results, this build is probably CPU-only and needs to be rebuilt with\n"
+                         "  CUDA enabled (FluxInfer does not build llama.cpp itself).\n";
+        }
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // fluxinfer tune <model.gguf>
 // ---------------------------------------------------------------------
 int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt, const std::string& profiles_dir_opt,
@@ -548,6 +647,9 @@ int main(int argc, char** argv) {
     unsigned compare_repeats = 0;
     unsigned warmup_runs = 1;
     std::string report_out;
+    CLI::App* doctor_cmd = app.add_subcommand("doctor", "Diagnose the llama.cpp build, its capabilities and the GPU setup");
+    add_common_options(doctor_cmd);
+
     CLI::App* tune_cmd = app.add_subcommand("tune", "Benchmark and select the best llama.cpp configuration for a model");
     tune_cmd->add_option("model", tune_model, "Path to a .gguf model file")->required();
     tune_cmd->add_option("--vram-headroom-mb", vram_headroom_mb,
@@ -602,6 +704,9 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (*doctor_cmd) {
+        return cmd_doctor(llama_dir_opt);
+    }
     if (*inspect_cmd) {
         return cmd_inspect(llama_dir_opt);
     }

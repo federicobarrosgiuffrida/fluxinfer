@@ -172,6 +172,7 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 // ---------------------------------------------------------------------
 int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt, const std::string& profiles_dir_opt,
              unsigned timeout_seconds, unsigned search_repetitions, unsigned context_length, unsigned compare_repeats,
+             unsigned vram_headroom_mb,
              unsigned warmup_runs, const std::string& report_out_opt) {
     const std::filesystem::path model_path(model_path_str);
 
@@ -225,6 +226,7 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     options.supported_flags = supported_flags;
     options.real_layer_count = gguf.valid ? gguf.metadata.block_count : std::nullopt;
     options.per_run_timeout = std::chrono::seconds(timeout_seconds);
+    options.vram_headroom_bytes = static_cast<std::uint64_t>(vram_headroom_mb) * 1024ULL * 1024ULL;
     options.search_repetitions = std::max(1u, search_repetitions);
     options.context_length = context_length;
     std::cout << "Tuning and serving at context size " << context_length
@@ -526,6 +528,7 @@ int main(int argc, char** argv) {
 
     std::string tune_model;
     unsigned tune_timeout_seconds = 60;
+    unsigned vram_headroom_mb = 0;
     unsigned search_repetitions = 3;
     unsigned context_length = 4096;
     unsigned compare_repeats = 0;
@@ -533,6 +536,8 @@ int main(int argc, char** argv) {
     std::string report_out;
     CLI::App* tune_cmd = app.add_subcommand("tune", "Benchmark and select the best llama.cpp configuration for a model");
     tune_cmd->add_option("model", tune_model, "Path to a .gguf model file")->required();
+    tune_cmd->add_option("--vram-headroom-mb", vram_headroom_mb,
+                          "VRAM (MB) to leave free when estimating how many layers fit (0 = platform default)");
     tune_cmd->add_option("--timeout", tune_timeout_seconds, "Per-benchmark timeout in seconds (per llama-bench repetition)")
         ->default_val(60);
     tune_cmd
@@ -584,7 +589,7 @@ int main(int argc, char** argv) {
     }
     if (*tune_cmd) {
         return cmd_tune(tune_model, llama_dir_opt, profiles_dir_opt, tune_timeout_seconds, search_repetitions,
-                         context_length, compare_repeats, warmup_runs, report_out);
+                         context_length, compare_repeats, vram_headroom_mb, warmup_runs, report_out);
     }
     if (*run_cmd) {
         return cmd_run(run_model, llama_dir_opt, profiles_dir_opt, run_extra_args);

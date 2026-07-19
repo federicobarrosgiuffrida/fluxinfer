@@ -207,6 +207,7 @@ TuningOutcome Tuner::run() {
     psi.supported_flags = options_.supported_flags;
     psi.model_size_bytes = model_size_bytes_;
     psi.real_layer_count = options_.real_layer_count;
+    psi.vram_headroom_bytes = options_.vram_headroom_bytes;
 
     const bool gpu_layers_stage_enabled =
         options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;

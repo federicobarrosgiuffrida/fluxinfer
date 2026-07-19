@@ -24,15 +24,34 @@ struct ParameterSpaceInput {
     // (see gpu_layers_candidates()) is skipped entirely rather than
     // guessing from file size.
     std::optional<std::uint64_t> real_layer_count;
+
+    // VRAM deliberately left unused by the offload estimate below, on top
+    // of what the KV cache and activations need. Two reasons it is not
+    // zero: other processes (compositor, browser, chat clients) hold a
+    // moving amount of VRAM, and on Windows/WDDM filling the last few
+    // hundred MB does not fail cleanly -- the driver starts backing
+    // allocations with system RAM and throughput collapses silently
+    // instead of reporting OOM. 0 means "use default_vram_headroom_bytes()".
+    std::uint64_t vram_headroom_bytes = 0;
 };
+
+// Platform default for ParameterSpaceInput::vram_headroom_bytes: larger on
+// Windows, where the silent WDDM spill described above makes running near
+// the VRAM limit actively harmful rather than merely risky.
+std::uint64_t default_vram_headroom_bytes();
 
 // Stage 1: a single conservative, GPU-free baseline configuration.
 TuneConfig baseline_config(const ParameterSpaceInput& input);
 
 // Stage 2: candidates at ~0/25/50/75/100% of the model's real layer count
 // (deduplicated), always including 0 (no offload) and the full layer count
-// (full offload) at the extremes. Empty if there is no GPU or
-// real_layer_count is unavailable -- this stage is never run on a guess.
+// (full offload) at the extremes, plus -- when the model size and VRAM are
+// both known -- one extra candidate seeded from how many layers actually fit
+// in (available VRAM - headroom). That seed only decides where to *look*
+// first; as everywhere else in the tuner, what is usable is still decided by
+// running the benchmark and observing real OOM/timeouts, never by the
+// estimate. Empty if there is no GPU or real_layer_count is unavailable --
+// this stage is never run on a guess.
 std::vector<TuneConfig> gpu_layers_candidates(const ParameterSpaceInput& input, const TuneConfig& base);
 
 // Stage 3: a handful of (batch, ubatch) pairs, trimmed based on available

@@ -28,6 +28,10 @@ struct TunerOptions {
     // than falling back to any estimate -- see parameter_space.hpp.
     std::optional<std::uint64_t> real_layer_count;
 
+    // Passed through to ParameterSpaceInput::vram_headroom_bytes (0 =
+    // platform default, see parameter_space.hpp).
+    std::uint64_t vram_headroom_bytes = 0;
+
     std::chrono::milliseconds per_run_timeout{60000};
     unsigned prompt_tokens_for_bench = 512; // -p
     unsigned gen_tokens_for_bench = 128;    // -n

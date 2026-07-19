@@ -6,6 +6,20 @@
 
 namespace fluxinfer::tuner {
 
+std::uint64_t default_vram_headroom_bytes() {
+    constexpr std::uint64_t kMiB = 1024ULL * 1024;
+#if defined(_WIN32)
+    // Measured on an RTX 3060 12GB running a 21GB MoE model: with ~300MB
+    // free, generation and prompt throughput dropped to a fraction of the
+    // next-lower offload setting while llama.cpp still reported success and
+    // no CUDA OOM -- the WDDM driver had silently started spilling to
+    // system RAM. Leaving ~1.5GB unused avoided that regime entirely.
+    return 1536 * kMiB;
+#else
+    return 1024 * kMiB;
+#endif
+}
+
 TuneConfig baseline_config(const ParameterSpaceInput& input) {
     TuneConfig config;
     config.threads = std::max(1u, input.hardware.cpu.physical_cores);
@@ -38,6 +52,22 @@ std::vector<TuneConfig> gpu_layers_candidates(const ParameterSpaceInput& input, 
     // offload) and total_layers (full offload) must always be probed.
     layer_values.insert(0);
     layer_values.insert(total_layers);
+
+    // Seed one extra candidate where the weights are actually expected to
+    // fit. The fixed percentiles above can straddle the real boundary badly
+    // (on a 12GB card with a 21GB model, 50% is already far past it and 25%
+    // far short), which wastes probes and leaves the binary-search
+    // refinement to do all the work from a poor starting bracket.
+    const std::uint64_t headroom =
+        input.vram_headroom_bytes > 0 ? input.vram_headroom_bytes : default_vram_headroom_bytes();
+    const std::uint64_t vram = input.hardware.gpu.available_vram_bytes;
+    if (input.model_size_bytes > 0 && vram > headroom) {
+        const double bytes_per_layer = static_cast<double>(input.model_size_bytes) / static_cast<double>(total_layers);
+        if (bytes_per_layer > 0.0) {
+            const auto fitting = static_cast<std::int64_t>(static_cast<double>(vram - headroom) / bytes_per_layer);
+            layer_values.insert(std::clamp<std::int64_t>(fitting, 0, total_layers));
+        }
+    }
 
     for (std::int64_t layers : layer_values) {
         TuneConfig config = base;

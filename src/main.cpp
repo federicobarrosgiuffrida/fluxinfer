@@ -107,6 +107,19 @@ void install_termination_forwarding(process::InteractiveProcess* proc) {
 #endif
 }
 
+void print_gpu(const hardware::GpuInfo& gpu, const char* indent) {
+    std::cout << indent << "Name: " << gpu.name << " (device " << gpu.index << ")\n";
+    std::cout << indent << "Total VRAM: " << format_gib(gpu.total_vram_bytes) << "\n";
+    std::cout << indent << "Available VRAM: " << format_gib(gpu.available_vram_bytes) << "\n";
+    std::cout << indent << "Compute capability: ";
+    if (gpu.has_compute_capability()) {
+        std::cout << gpu.compute_capability_major << "." << gpu.compute_capability_minor << "\n";
+    } else {
+        std::cout << "unknown (driver did not report it)\n";
+    }
+    std::cout << indent << "Backend: " << gpu.backend << "\n";
+}
+
 // ---------------------------------------------------------------------
 // fluxinfer inspect
 // ---------------------------------------------------------------------
@@ -124,10 +137,14 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 
     std::cout << "GPU:\n";
     if (hw.gpu.available) {
-        std::cout << "  Name: " << hw.gpu.name << "\n";
-        std::cout << "  Total VRAM: " << format_gib(hw.gpu.total_vram_bytes) << "\n";
-        std::cout << "  Available VRAM: " << format_gib(hw.gpu.available_vram_bytes) << "\n";
-        std::cout << "  Backend: " << hw.gpu.backend << "\n\n";
+        print_gpu(hw.gpu, "  ");
+        // Additional devices are reported but never tuned against: FluxInfer
+        // benchmarks and serves on the primary device only.
+        for (std::size_t i = 1; i < hw.gpus.size(); ++i) {
+            std::cout << "  --- additional device (not used for tuning) ---\n";
+            print_gpu(hw.gpus[i], "  ");
+        }
+        std::cout << "\n";
     } else {
         std::cout << "  Not available (" << hw.gpu.unavailable_reason << ")\n\n";
     }

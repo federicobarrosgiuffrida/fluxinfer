@@ -1,10 +1,13 @@
 #include "fluxinfer/tuner/tuner.hpp"
 
+#include "fluxinfer/hardware/vram_sampler.hpp"
+
 #include "fluxinfer/llama/benchmark_parser.hpp"
 #include "fluxinfer/llama/llama_runner.hpp"
 #include "fluxinfer/tuner/parameter_space.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <system_error>
 
 namespace fluxinfer::tuner {
@@ -105,8 +108,16 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
         static_cast<std::int64_t>(model_size_bytes_ / kGiB) * kTimeoutMillisPerGiB * std::max(1u, repetitions));
     effective_timeout = std::max(effective_timeout, size_based);
 
+    // Measure what the card is actually doing during the run. The sampler
+    // is GPU-wide and coarse (see VramSampler), which is the right scope
+    // here: the question is whether the *card* ran out of room, including
+    // whatever else the machine had resident at the time.
+    hardware::VramSampler sampler;
+    sampler.start();
     llama::LlamaRunResult run =
         llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout, options_.idle_timeout);
+    sampler.stop();
+    result.measured_peak_vram_bytes = sampler.peak_used_bytes();
 
     result.ran = run.outcome != process::ProcessOutcome::FailedToStart;
     result.exit_code = run.exit_code;
@@ -221,6 +232,9 @@ TuningOutcome Tuner::run() {
     psi.real_layer_count = options_.real_layer_count;
     psi.vram_headroom_bytes = options_.vram_headroom_bytes;
 
+    const std::uint64_t headroom =
+        options_.vram_headroom_bytes > 0 ? options_.vram_headroom_bytes : default_vram_headroom_bytes();
+
     const bool gpu_layers_stage_enabled =
         options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;
 
@@ -242,11 +256,23 @@ TuningOutcome Tuner::run() {
 
         int last_good_layers = -1;
         int oom_layers = -1;
+        std::optional<BenchmarkResult> last_good_result;
         for (const auto& candidate : candidates) {
             if (oom_layers >= 0 && candidate.gpu_layers >= oom_layers) {
                 continue;
             }
             BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            // A successful-looking run that filled the card and collapsed
+            // relative to the last good one is a silent WDDM spill, not a
+            // usable candidate: treat it exactly like an OOM boundary, so
+            // nothing above it is attempted and it cannot win on score.
+            if (last_good_result &&
+                looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                result.vram_spill_suspected = true;
+                outcome.all_results.push_back(result);
+                oom_layers = candidate.gpu_layers;
+                continue;
+            }
             outcome.all_results.push_back(result);
             if (result.oom) {
                 oom_layers = candidate.gpu_layers;
@@ -266,6 +292,7 @@ TuningOutcome Tuner::run() {
             // capacity -- the next, larger candidate is still attempted.
             if (result.usable()) {
                 last_good_layers = candidate.gpu_layers;
+                last_good_result = result;
                 if (result.score > best.score) {
                     best = result;
                 }
@@ -281,12 +308,20 @@ TuningOutcome Tuner::run() {
             midpoint.gpu_layers = midpoint_layers;
             midpoint.label = "gpu_layers=" + std::to_string(midpoint_layers) + " (binary search)";
             BenchmarkResult mid_result = run_one(midpoint, options_.search_repetitions, false);
-            outcome.all_results.push_back(mid_result);
             ++probes;
+            if (last_good_result &&
+                looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_spill_suspected = true;
+                outcome.all_results.push_back(mid_result);
+                oom_layers = midpoint_layers;
+                continue;
+            }
+            outcome.all_results.push_back(mid_result);
             if (mid_result.oom) {
                 oom_layers = midpoint_layers;
             } else if (mid_result.usable()) {
                 last_good_layers = midpoint_layers;
+                last_good_result = mid_result;
                 if (mid_result.score > best.score) {
                     best = mid_result;
                 }

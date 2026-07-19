@@ -235,7 +235,9 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
                  "run/serve will launch llama-cli/llama-server with via -c).\n";
     options.on_result = [](const tuner::BenchmarkResult& result) {
         std::cout << "  [" << result.config.label << "] ";
-        if (result.oom) {
+        if (result.vram_spill_suspected) {
+            std::cout << "rejected: VRAM full and throughput collapsed (silent spill to system RAM)\n";
+        } else if (result.oom) {
             std::cout << "OOM\n";
         } else if (result.crashed) {
             std::cout << "crashed (exit " << result.exit_code << ")\n";

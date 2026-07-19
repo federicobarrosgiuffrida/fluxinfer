@@ -36,4 +36,26 @@ double compute_memory_pressure_penalty(std::uint64_t estimated_ram_bytes, std::u
 double compute_score(const BenchmarkResult& result, std::uint64_t available_ram_bytes, std::uint64_t available_vram_bytes,
                       const ScoringWeights& weights = {});
 
+// True when `candidate` -- a run that pushed more work onto the GPU than
+// `reference` did and completed without error -- nonetheless shows the
+// signature of a silent VRAM spill: the card was left with less than
+// `headroom_bytes` free, and throughput fell well below the less
+// GPU-heavy `reference` instead of improving.
+//
+// This exists because the failure it detects does not announce itself. On
+// Windows, an allocation that no longer fits in VRAM is not rejected: the
+// WDDM driver satisfies it from system RAM and inference keeps running at
+// a fraction of the speed, with no CUDA OOM anywhere in the output. A
+// search that only reacts to OOM will happily pick such a configuration on
+// the grounds that it "worked".
+//
+// Measured on an RTX 3060 12GB with a 21GB MoE model: at the offload
+// setting that left ~260MB free, prompt processing fell to roughly an
+// eighth and generation to under two thirds of the next-lower setting,
+// with every run reported as successful. Both `candidate` and `reference`
+// must be usable runs with a measured VRAM peak; otherwise this returns
+// false (no measurement, no accusation).
+bool looks_like_vram_spill(const BenchmarkResult& candidate, const BenchmarkResult& reference,
+                            std::uint64_t total_vram_bytes, std::uint64_t headroom_bytes);
+
 } // namespace fluxinfer::tuner

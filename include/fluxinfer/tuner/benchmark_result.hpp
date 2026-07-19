@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,23 @@ struct BenchmarkResult {
 
     std::uint64_t estimated_ram_bytes = 0;
     std::uint64_t estimated_vram_bytes = 0;
+
+    // Peak GPU-wide VRAM usage observed by polling NVML while this run was
+    // in flight (see hardware::VramSampler). std::nullopt when no GPU
+    // sample could be taken. Unlike estimated_vram_bytes this is measured,
+    // but it is still GPU-wide: it includes whatever other processes were
+    // holding at the time, which is exactly what matters for deciding
+    // whether the card was full.
+    std::optional<std::uint64_t> measured_peak_vram_bytes;
+
+    // Set when a run completed "successfully" but shows the signature of a
+    // silent over-VRAM spill: the card was effectively full and throughput
+    // collapsed relative to a less GPU-heavy configuration. On Windows,
+    // WDDM backs such allocations with system RAM instead of failing, so
+    // there is no OOM to detect -- the run looks fine and is simply slow.
+    // Treated as a boundary by the search, like an OOM, rather than as a
+    // usable candidate.
+    bool vram_spill_suspected = false;
 
     std::chrono::milliseconds duration{0};
     double score = 0.0;

@@ -55,4 +55,35 @@ double compute_score(const BenchmarkResult& result, std::uint64_t available_ram_
            penalty * weights.memory_pressure_weight;
 }
 
+bool looks_like_vram_spill(const BenchmarkResult& candidate, const BenchmarkResult& reference,
+                            std::uint64_t total_vram_bytes, std::uint64_t headroom_bytes) {
+    // A throughput drop this large going *up* the offload scale is not a
+    // tuning nuance; healthy configurations differ by tens of percent, not
+    // by multiples. Set well below the measured case (prompt processing at
+    // ~12% of the neighbouring setting) so ordinary noise cannot trip it.
+    constexpr double kCollapseRatio = 0.6;
+
+    if (!candidate.usable() || !reference.usable()) {
+        return false;
+    }
+    if (!candidate.measured_peak_vram_bytes || total_vram_bytes == 0) {
+        return false;
+    }
+    const std::uint64_t peak = *candidate.measured_peak_vram_bytes;
+    if (peak > total_vram_bytes) {
+        return false; // nonsensical sample; do not act on it
+    }
+    const std::uint64_t free_at_peak = total_vram_bytes - peak;
+    if (free_at_peak >= headroom_bytes) {
+        return false; // there was room to spare: whatever happened, it was not a spill
+    }
+
+    const bool generation_collapsed = reference.generation_tokens_per_second > 0.0 &&
+                                       candidate.generation_tokens_per_second <
+                                           reference.generation_tokens_per_second * kCollapseRatio;
+    const bool prompt_collapsed = reference.prompt_tokens_per_second > 0.0 &&
+                                   candidate.prompt_tokens_per_second < reference.prompt_tokens_per_second * kCollapseRatio;
+    return generation_collapsed || prompt_collapsed;
+}
+
 } // namespace fluxinfer::tuner

@@ -172,7 +172,7 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 // ---------------------------------------------------------------------
 int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt, const std::string& profiles_dir_opt,
              unsigned timeout_seconds, unsigned search_repetitions, unsigned context_length, unsigned compare_repeats,
-             unsigned vram_headroom_mb, unsigned idle_timeout_seconds,
+             unsigned vram_headroom_mb, unsigned idle_timeout_seconds, bool no_moe_tune,
              unsigned warmup_runs, const std::string& report_out_opt) {
     const std::filesystem::path model_path(model_path_str);
 
@@ -212,7 +212,7 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
         }
         if (gguf.metadata.expert_count && *gguf.metadata.expert_count > 0) {
             std::cout << " experts=" << *gguf.metadata.expert_count << "/" << gguf.metadata.expert_used_count.value_or(0)
-                       << " active (MoE model: this MVP does not do MoE-aware tuning yet)";
+                       << " active (MoE model)";
         }
         std::cout << "\n";
     } else {
@@ -225,6 +225,8 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     options.hardware = hw;
     options.supported_flags = supported_flags;
     options.real_layer_count = gguf.valid ? gguf.metadata.block_count : std::nullopt;
+    options.expert_count = gguf.valid ? gguf.metadata.expert_count : std::nullopt;
+    options.moe_tuning_enabled = !no_moe_tune;
     options.per_run_timeout = std::chrono::seconds(timeout_seconds);
     options.vram_headroom_bytes = static_cast<std::uint64_t>(vram_headroom_mb) * 1024ULL * 1024ULL;
     options.idle_timeout = std::chrono::seconds(idle_timeout_seconds);
@@ -272,6 +274,7 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     profile.best_config.ubatch_size = best.config.ubatch_size;
     profile.best_config.kv_cache_type = best.config.kv_cache_type;
     profile.best_config.context_length = context_length;
+    profile.best_config.n_cpu_moe = outcome.best->config.n_cpu_moe;
     profile.results.prompt_tps = best.prompt_tokens_per_second;
     profile.results.generation_tps = best.generation_tokens_per_second;
     profile.results.duration_ms = best.duration.count();
@@ -396,6 +399,12 @@ std::vector<std::string> build_config_arguments(const profiles::Profile& profile
     // that case rather than guessing.
     if (profile.best_config.context_length > 0) {
         add_if_supported("--ctx-size", "-c", std::to_string(profile.best_config.context_length));
+    }
+    // MoE expert placement, replayed exactly as benchmarked. Paired with
+    // -ngl above, which the tuner set to the model's full layer count for
+    // these models.
+    if (profile.best_config.n_cpu_moe) {
+        add_if_supported("--n-cpu-moe", "--n-cpu-moe", std::to_string(*profile.best_config.n_cpu_moe));
     }
     if (profile.best_config.kv_cache_type) {
         if (llama::supports_flag(supported_flags, "--cache-type-k")) {
@@ -532,6 +541,7 @@ int main(int argc, char** argv) {
     std::string tune_model;
     unsigned tune_timeout_seconds = 60;
     unsigned tune_idle_timeout_seconds = 60;
+    bool no_moe_tune = false;
     unsigned vram_headroom_mb = 0;
     unsigned search_repetitions = 3;
     unsigned context_length = 4096;
@@ -542,6 +552,8 @@ int main(int argc, char** argv) {
     tune_cmd->add_option("model", tune_model, "Path to a .gguf model file")->required();
     tune_cmd->add_option("--vram-headroom-mb", vram_headroom_mb,
                           "VRAM (MB) to leave free when estimating how many layers fit (0 = platform default)");
+    tune_cmd->add_flag("--no-moe-tune", no_moe_tune,
+                        "Skip the MoE expert-placement search and tune this model as if it were dense");
     tune_cmd->add_option("--idle-timeout", tune_idle_timeout_seconds,
                           "Give up on a benchmark that produces no output for this many seconds (0 = never)");
     tune_cmd->add_option("--timeout", tune_timeout_seconds, "Minimum per-benchmark time budget in seconds (per repetition; scaled up automatically for large models)")
@@ -595,8 +607,8 @@ int main(int argc, char** argv) {
     }
     if (*tune_cmd) {
         return cmd_tune(tune_model, llama_dir_opt, profiles_dir_opt, tune_timeout_seconds, search_repetitions,
-                         context_length, compare_repeats, vram_headroom_mb, tune_idle_timeout_seconds, warmup_runs,
-                         report_out);
+                         context_length, compare_repeats, vram_headroom_mb, tune_idle_timeout_seconds, no_moe_tune,
+                         warmup_runs, report_out);
     }
     if (*run_cmd) {
         return cmd_run(run_model, llama_dir_opt, profiles_dir_opt, run_extra_args);

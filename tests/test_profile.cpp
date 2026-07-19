@@ -278,3 +278,58 @@ TEST_CASE("ProfileStore::load_valid reports a clear reason when no profile exist
 
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("n_cpu_moe survives a profile round-trip, including the value 0", "[profile][moe]") {
+    Profile profile;
+    profile.model.path = "model.gguf";
+    profile.model.size_bytes = 21ULL * 1024 * 1024 * 1024;
+    profile.model.fingerprint = "abc123";
+    profile.best_config.threads = 9;
+    profile.best_config.gpu_layers = 40;
+    profile.best_config.batch_size = 2048;
+    profile.best_config.ubatch_size = 512;
+    profile.best_config.context_length = 4096;
+
+    SECTION("a tuned value round-trips") {
+        profile.best_config.n_cpu_moe = 26;
+        std::string error;
+        std::optional<Profile> restored = profile_from_json(to_json(profile), &error);
+        REQUIRE(restored.has_value());
+        REQUIRE(restored->best_config.n_cpu_moe.has_value());
+        CHECK(*restored->best_config.n_cpu_moe == 26);
+    }
+
+    SECTION("0 is a real value, not 'unset'") {
+        profile.best_config.n_cpu_moe = 0;
+        std::optional<Profile> restored = profile_from_json(to_json(profile));
+        REQUIRE(restored.has_value());
+        REQUIRE(restored->best_config.n_cpu_moe.has_value());
+        CHECK(*restored->best_config.n_cpu_moe == 0);
+    }
+
+    SECTION("a dense model stores no value") {
+        std::optional<Profile> restored = profile_from_json(to_json(profile));
+        REQUIRE(restored.has_value());
+        CHECK_FALSE(restored->best_config.n_cpu_moe.has_value());
+    }
+}
+
+TEST_CASE("profiles written before MoE tuning still load", "[profile][moe]") {
+    // Exactly the document an older FluxInfer wrote: no n_cpu_moe key at all.
+    nlohmann::json older = {
+        {"schema_version", 1},
+        {"model", {{"path", "model.gguf"}, {"size_bytes", 123456}, {"fingerprint", "abc123"}}},
+        {"hardware", {{"cpu", "test"}, {"logical_threads", 8}, {"ram_bytes", 16384}, {"gpu", "test-gpu"}, {"vram_bytes", 8192}}},
+        {"llama", {{"version", "b1234"}, {"binary_path", "llama-bench"}, {"supported_flags", nlohmann::json::array()}}},
+        {"best_config",
+         {{"threads", 8}, {"gpu_layers", 32}, {"batch_size", 512}, {"ubatch_size", 256}, {"kv_cache_type", nullptr},
+          {"context_length", 4096}}},
+        {"results", {{"prompt_tps", 100.0}, {"generation_tps", 20.0}, {"duration_ms", 1000}, {"score", 42.0}}}};
+
+    std::string error;
+    std::optional<Profile> restored = profile_from_json(older, &error);
+    REQUIRE(restored.has_value());
+    CHECK(error.empty());
+    CHECK_FALSE(restored->best_config.n_cpu_moe.has_value());
+    CHECK(restored->best_config.gpu_layers == 32);
+}

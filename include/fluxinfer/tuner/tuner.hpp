@@ -28,6 +28,15 @@ struct TunerOptions {
     // than falling back to any estimate -- see parameter_space.hpp.
     std::optional<std::uint64_t> real_layer_count;
 
+    // Expert count from GGUF metadata; > 1 selects the MoE expert-placement
+    // search in place of the dense gpu-layers search. See
+    // parameter_space.hpp's n_cpu_moe_candidates().
+    std::optional<std::uint64_t> expert_count;
+
+    // Set false to skip the MoE stage and tune the model as if it were
+    // dense (--no-moe-tune).
+    bool moe_tuning_enabled = true;
+
     // Passed through to ParameterSpaceInput::vram_headroom_bytes (0 =
     // platform default, see parameter_space.hpp).
     std::uint64_t vram_headroom_bytes = 0;

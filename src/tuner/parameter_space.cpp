@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <set>
 
 namespace fluxinfer::tuner {
@@ -73,6 +74,47 @@ std::vector<TuneConfig> gpu_layers_candidates(const ParameterSpaceInput& input, 
         TuneConfig config = base;
         config.gpu_layers = static_cast<int>(layers);
         config.label = "gpu_layers=" + std::to_string(layers);
+        candidates.push_back(config);
+    }
+    return candidates;
+}
+
+bool is_moe_tunable(const ParameterSpaceInput& input) {
+    if (!input.hardware.gpu.available || !input.expert_count || *input.expert_count <= 1) {
+        return false;
+    }
+    if (!input.real_layer_count || *input.real_layer_count == 0) {
+        return false;
+    }
+    // No point generating candidates a llama-bench that predates the flag
+    // would reject; the caller falls back to the dense search instead.
+    return input.supported_flags.count("--n-cpu-moe") != 0;
+}
+
+std::vector<TuneConfig> n_cpu_moe_candidates(const ParameterSpaceInput& input, const TuneConfig& base) {
+    std::vector<TuneConfig> candidates;
+    if (!is_moe_tunable(input)) {
+        return candidates;
+    }
+
+    const auto total_layers = static_cast<std::int64_t>(*input.real_layer_count);
+
+    std::set<std::int64_t, std::greater<std::int64_t>> values; // descending: safest first
+    for (int pct : {100, 75, 50, 25, 0}) {
+        std::int64_t layers_on_cpu = static_cast<std::int64_t>(std::llround(total_layers * (pct / 100.0)));
+        values.insert(std::clamp<std::int64_t>(layers_on_cpu, 0, total_layers));
+    }
+    values.insert(total_layers);
+    values.insert(0);
+
+    for (std::int64_t layers_on_cpu : values) {
+        TuneConfig config = base;
+        // Everything that is not an expert tensor goes to the GPU; the
+        // experts are then placed by --n-cpu-moe. Mirrors the manual
+        // `-ngl 99 --n-cpu-moe N` recipe this stage automates.
+        config.gpu_layers = static_cast<int>(total_layers);
+        config.n_cpu_moe = static_cast<int>(layers_on_cpu);
+        config.label = "n_cpu_moe=" + std::to_string(layers_on_cpu);
         candidates.push_back(config);
     }
     return candidates;

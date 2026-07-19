@@ -25,6 +25,14 @@ struct ParameterSpaceInput {
     // guessing from file size.
     std::optional<std::uint64_t> real_layer_count;
 
+    // Number of experts declared by the model's own GGUF metadata
+    // ("<architecture>.expert_count"), read by
+    // fluxinfer::llama::parse_gguf_metadata(). Anything greater than 1
+    // means this is a mixture-of-experts model and the offload search has
+    // to work differently -- see n_cpu_moe_candidates(). std::nullopt or
+    // <= 1 means "treat as a dense model", never a guess.
+    std::optional<std::uint64_t> expert_count;
+
     // VRAM deliberately left unused by the offload estimate below, on top
     // of what the KV cache and activations need. Two reasons it is not
     // zero: other processes (compositor, browser, chat clients) hold a
@@ -53,6 +61,30 @@ TuneConfig baseline_config(const ParameterSpaceInput& input);
 // estimate. Empty if there is no GPU or real_layer_count is unavailable --
 // this stage is never run on a guess.
 std::vector<TuneConfig> gpu_layers_candidates(const ParameterSpaceInput& input, const TuneConfig& base);
+
+// True when the model is a mixture-of-experts model *and* the located
+// llama-bench build understands --n-cpu-moe, i.e. when the expert-placement
+// search below can run at all.
+bool is_moe_tunable(const ParameterSpaceInput& input);
+
+// Stage 2, MoE variant: how many layers keep their experts in system RAM
+// (llama.cpp's --n-cpu-moe), from "all of them" down towards "none".
+//
+// This replaces the gpu-layers search rather than complementing it. In a
+// MoE model the expert tensors dominate the weights but only a fraction of
+// them is read per token, so the useful question is not "how many whole
+// layers fit on the GPU" but "which parts of each layer should live there".
+// Sweeping --n-gpu-layers on such a model produces non-monotonic, misleading
+// results: measured on Qwen3.6-35B-A3B, throughput peaked mid-range and then
+// fell off, so the search's assumption that more offload is better until it
+// fails does not hold. With expert tensors placed explicitly, every layer
+// goes to the GPU (-ngl = all layers) and --n-cpu-moe becomes the axis that
+// actually trades VRAM for speed monotonically.
+//
+// Candidates descend from all-experts-on-CPU (safe, lowest VRAM) towards
+// none, so the search meets its VRAM limit walking in a known direction.
+// Empty when is_moe_tunable() is false or the layer count is unknown.
+std::vector<TuneConfig> n_cpu_moe_candidates(const ParameterSpaceInput& input, const TuneConfig& base);
 
 // Stage 3: a handful of (batch, ubatch) pairs, trimmed based on available
 // RAM so obviously oversized combinations aren't attempted on small

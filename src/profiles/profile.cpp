@@ -61,6 +61,7 @@ json to_json(const Profile& profile) {
         {"ubatch_size", profile.best_config.ubatch_size},
         {"kv_cache_type", profile.best_config.kv_cache_type ? json(*profile.best_config.kv_cache_type) : json(nullptr)},
         {"context_length", profile.best_config.context_length},
+        {"n_cpu_moe", profile.best_config.n_cpu_moe ? json(*profile.best_config.n_cpu_moe) : json(nullptr)},
     };
 
     j["results"] = {
@@ -115,6 +116,11 @@ std::optional<Profile> profile_from_json(const json& j, std::string* error) {
         // value() default (0) keeps older profiles saved before this field
         // existed loadable: they simply behave as before (no explicit -c).
         profile.best_config.context_length = best.value("context_length", std::uint64_t{0});
+        // Absent in profiles written before MoE tuning existed; absence
+        // means "dense model / not tuned", which is exactly nullopt.
+        if (best.contains("n_cpu_moe") && !best["n_cpu_moe"].is_null()) {
+            profile.best_config.n_cpu_moe = best["n_cpu_moe"].get<int>();
+        }
 
         const auto& results = j.at("results");
         profile.results.prompt_tps = results.at("prompt_tps").get<double>();

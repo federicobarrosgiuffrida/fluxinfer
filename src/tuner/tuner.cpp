@@ -61,6 +61,10 @@ std::vector<std::string> Tuner::build_arguments(const TuneConfig& config, unsign
         args.push_back("--no-warmup");
     }
 
+    if (config.n_cpu_moe) {
+        add_if_supported(args, options_.supported_flags, "--n-cpu-moe", "-ncmoe", std::to_string(*config.n_cpu_moe));
+    }
+
     if (config.kv_cache_type) {
         if (llama::supports_flag(options_.supported_flags, "--cache-type-k")) {
             args.push_back("-ctk");
@@ -231,12 +235,18 @@ TuningOutcome Tuner::run() {
     psi.model_size_bytes = model_size_bytes_;
     psi.real_layer_count = options_.real_layer_count;
     psi.vram_headroom_bytes = options_.vram_headroom_bytes;
+    psi.expert_count = options_.moe_tuning_enabled ? options_.expert_count : std::nullopt;
 
     const std::uint64_t headroom =
         options_.vram_headroom_bytes > 0 ? options_.vram_headroom_bytes : default_vram_headroom_bytes();
 
+    // A MoE model uses the expert-placement search *instead of* the dense
+    // gpu-layers sweep: on such models the latter is not merely suboptimal
+    // but misleading (non-monotonic), so running both would waste probes
+    // and could hand the wrong configuration to the later stages.
+    const bool moe_stage_enabled = is_moe_tunable(psi);
     const bool gpu_layers_stage_enabled =
-        options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;
+        !moe_stage_enabled && options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;
 
     // Stage 1: baseline.
     const TuneConfig baseline = baseline_config(psi);
@@ -332,6 +342,82 @@ TuningOutcome Tuner::run() {
                 // last_good_layers/best -- see the identical reasoning in
                 // the main candidate loop above.
                 oom_layers = midpoint_layers;
+            }
+        }
+    }
+
+    // Stage 2 (MoE variant): expert placement. Walks --n-cpu-moe down from
+    // "every layer's experts in system RAM" towards "none", i.e. from the
+    // lowest VRAM demand to the highest, so the search approaches its limit
+    // from the safe side. The first value that OOMs or shows a silent spill
+    // becomes the floor, and a bounded bisection then closes the gap
+    // between it and the last good value.
+    if (moe_stage_enabled) {
+        std::vector<TuneConfig> candidates = n_cpu_moe_candidates(psi, baseline);
+
+        int last_good_ncmoe = -1;
+        int failed_ncmoe = -1; // lowest value known to fail; nothing below it is tried
+        std::optional<BenchmarkResult> last_good_result;
+        for (const auto& candidate : candidates) {
+            const int ncmoe = candidate.n_cpu_moe.value_or(0);
+            if (failed_ncmoe >= 0 && ncmoe <= failed_ncmoe) {
+                continue;
+            }
+            BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            if (last_good_result &&
+                looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                result.vram_spill_suspected = true;
+                outcome.all_results.push_back(result);
+                failed_ncmoe = ncmoe;
+                continue;
+            }
+            outcome.all_results.push_back(result);
+            if (result.oom) {
+                failed_ncmoe = ncmoe;
+                continue;
+            }
+            if (result.usable()) {
+                last_good_ncmoe = ncmoe;
+                last_good_result = result;
+                if (result.score > best.score) {
+                    best = result;
+                }
+            }
+        }
+
+        // Same bounded refinement as the dense search, mirrored: here the
+        // usable side is the *higher* value and the failing side the lower.
+        constexpr int kMaxRefinementProbes = 4;
+        int probes = 0;
+        while (failed_ncmoe >= 0 && last_good_ncmoe >= 0 && last_good_ncmoe - failed_ncmoe > 1 &&
+               probes < kMaxRefinementProbes) {
+            const int midpoint_ncmoe = failed_ncmoe + (last_good_ncmoe - failed_ncmoe) / 2;
+            TuneConfig midpoint = baseline;
+            midpoint.gpu_layers = static_cast<int>(options_.real_layer_count.value_or(0));
+            midpoint.n_cpu_moe = midpoint_ncmoe;
+            midpoint.label = "n_cpu_moe=" + std::to_string(midpoint_ncmoe) + " (binary search)";
+            BenchmarkResult mid_result = run_one(midpoint, options_.search_repetitions, false);
+            ++probes;
+            if (last_good_result &&
+                looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_spill_suspected = true;
+                outcome.all_results.push_back(mid_result);
+                failed_ncmoe = midpoint_ncmoe;
+                continue;
+            }
+            outcome.all_results.push_back(mid_result);
+            if (mid_result.usable()) {
+                last_good_ncmoe = midpoint_ncmoe;
+                last_good_result = mid_result;
+                if (mid_result.score > best.score) {
+                    best = mid_result;
+                }
+            } else {
+                // OOM, or inconclusive (timeout/crash): either way this
+                // value is not demonstrably usable, so it becomes the new
+                // floor rather than being promoted -- same reasoning as the
+                // dense search.
+                failed_ncmoe = midpoint_ncmoe;
             }
         }
     }

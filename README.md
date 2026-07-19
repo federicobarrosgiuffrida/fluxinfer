@@ -12,12 +12,14 @@ FluxInfer does **not** reimplement llama.cpp, does not link against it, and
 does not modify it. It only locates and invokes prebuilt
 `llama-bench` / `llama-cli` / `llama-server` binaries as external processes.
 
-## Status: experimental (milestone 0.3.1)
+## Status: experimental (milestone 0.4.0)
 
 Hardware detection, real GGUF metadata discovery, a staged benchmark search
-driven by the model's actual layer count, profile persistence, a
-reproducible repeated-measurement comparison report, and the four core
-subcommands (`inspect`, `tune`, `run`, `serve`). It has not been used in
+driven by the model's actual layer count, a MoE-aware expert-placement
+search (`--n-cpu-moe`), measured peak-VRAM sampling with silent-spill
+rejection, profile persistence, a reproducible repeated-measurement
+comparison report, and the five subcommands (`inspect`, `doctor`, `tune`,
+`run`, `serve`). It has not been used in
 production. Interfaces (CLI flags, profile JSON schema) may still change.
 
 **Tested on:** one machine, two models, one GPU — Qwen3.5-9B (dense, Q8_0)
@@ -135,8 +137,10 @@ it.
 
 ```bash
 fluxinfer inspect
-fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--llama-dir DIR] [--profiles-dir DIR]
-                                    [--context N] [--search-repetitions N]
+fluxinfer doctor
+fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--idle-timeout SECONDS] [--llama-dir DIR]
+                                    [--profiles-dir DIR] [--context N] [--search-repetitions N]
+                                    [--vram-headroom-mb N] [--no-moe-tune]
                                     [--compare-repeats N] [--warmup-runs N] [--report-out FILE]
 fluxinfer run   path/to/model.gguf [-- extra llama-cli args]
 fluxinfer serve path/to/model.gguf [--host HOST] [--port PORT] [-- extra llama-server args]
@@ -439,27 +443,40 @@ model. See `compute_model_info()` in
   both added after a real head-to-head against LM Studio (see
   [`docs/benchmarks/`](docs/benchmarks/)) showed single-sample decisions
   and a coarse boundary probe leaving real performance on the table.
-- No MoE-specific tuning yet: `expert_count`/`expert_used_count` are read
-  and surfaced (and `tune` prints a note when a model has active experts),
-  but the search itself doesn't yet treat MoE models any differently.
-  MoE-related llama.cpp flags (e.g. `--n-cpu-moe`) are only ever used if
-  auto-detected via `--help`, with no MoE-aware logic beyond that.
+- MoE tuning searches `--n-cpu-moe` at *whole-layer* granularity, which is
+  all llama.cpp exposes: GGUF stores a layer's routed experts as one fused
+  tensor, so individual experts cannot be placed separately from outside
+  the engine (see
+  [`docs/moe-vram-cache-research.md`](docs/moe-vram-cache-research.md)).
+  The search also picks layers by index, not by measured routing
+  popularity — informed placement is `0.5`, and requires per-layer
+  activation profiling that does not exist here yet. On MoE models the
+  dense `--n-gpu-layers` sweep is replaced rather than complemented
+  (`--no-moe-tune` forces the old behaviour), because that sweep is
+  non-monotonic on such models and its results are misleading.
 - The peak-VRAM sampler (`VramSampler`) polls NVML on a fixed interval from
   a background thread; it can miss short spikes between polls and reports
   GPU-wide usage (other processes included), not llama-bench's allocations
   specifically.
-- On Windows, an over-VRAM allocation is frequently reported by the WDDM
-  driver as a hang/timeout rather than a clean CUDA OOM error (observed in
-  practice, not just theorized). FluxInfer's OOM-boundary search treats a
-  timeout as *inconclusive* rather than a confirmed OOM (it won't select
-  it, but also won't necessarily stop climbing on it the way a confirmed
-  OOM does) specifically to avoid an unrelated slow run (e.g. a CPU-only
-  baseline exceeding its time budget) from being misread as a VRAM
-  ceiling. One consequence: a slow CPU-only config combined with
-  `--search-repetitions > 1` can hit the per-run timeout during the
-  search stage even though the same config succeeds fine given more time
-  (observed with the default `--timeout 60` and `--search-repetitions 3`
-  on a slow CPU baseline) — raise `--timeout` if you see this.
+- On Windows, an over-VRAM allocation does not fail cleanly. WDDM either
+  stalls the process (reported as a hang/timeout rather than a CUDA OOM)
+  or, worse, silently backs the allocation with system RAM so the run
+  *succeeds* at a fraction of the speed. FluxInfer handles both, but
+  neither perfectly:
+  - Timeouts are still treated as *inconclusive* rather than a confirmed
+    OOM (it won't select such a config, but won't necessarily stop
+    climbing on it either), so an unrelated slow run isn't misread as a
+    VRAM ceiling. Since `0.4.0` a run is only killed for being *silent*
+    (`--idle-timeout`), and the total budget scales with model size, so
+    healthy runs on large models are no longer cut short.
+  - Silent spills are caught by comparing measured peak VRAM and
+    throughput against the last good configuration
+    (`looks_like_vram_spill`). This is a heuristic with a deliberately
+    conservative threshold: a spill that costs less than ~40% of
+    throughput will not be flagged, and the guard depends on NVML samples
+    being available at all.
+  - `--vram-headroom-mb` (default 1.5GB on Windows, 1GB elsewhere) keeps
+    the search away from that regime in the first place.
 - `fluxinfer run`/`serve` re-detect supported flags from `llama-cli` /
   `llama-server`'s own `--help` output (which may differ from
   `llama-bench`'s), but profile *validity* is checked against
@@ -479,13 +496,15 @@ model. See `compute_model_info()` in
 0.1   hardware detection + launcher
 0.2   benchmark parser + profiles
 0.3   automatic tuning
-0.3.1 real GGUF metadata discovery + reproducible benchmark comparison   <- current
-0.4   static MoE expert-layer placement search (--n-cpu-moe as a tuned dimension)
+0.3.1 real GGUF metadata discovery + reproducible benchmark comparison
+0.4.0 static MoE expert-layer placement search (--n-cpu-moe as a tuned      <- current
+      dimension), measured VRAM + silent-spill rejection, idle-based
+      timeouts, `doctor`
 0.5   informed layer placement from offline expert-activation profiling (Linux/eBPF, opt-in)
 0.6   orchestration for a dynamic GPU expert cache, if/when one exists upstream
 ```
 
-Everything through `0.3.1` exists in an initial form; `0.4` onward is not
+Everything through `0.4.0` exists in an initial form; `0.5` onward is not
 implemented. `0.4`–`0.6` were reordered and re-scoped from the original
 plan after dedicated research — see
 [`docs/moe-vram-cache-research.md`](docs/moe-vram-cache-research.md) for

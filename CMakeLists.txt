@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.20)
 cmake_policy(SET CMP0091 NEW)
 
 project(fluxinfer
-    VERSION 0.3.1
+    VERSION 0.4.0
     DESCRIPTION "Multiplatform autotuner/wrapper for llama.cpp"
     LANGUAGES CXX
 )

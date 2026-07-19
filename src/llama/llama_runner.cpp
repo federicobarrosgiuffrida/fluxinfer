@@ -190,11 +190,15 @@ std::string detect_llama_version(const std::filesystem::path& llama_bench) {
 
 LlamaRunResult run_llama_binary(const std::filesystem::path& binary,
                                  const std::vector<std::string>& arguments,
-                                 std::chrono::milliseconds timeout) {
+                                 std::chrono::milliseconds timeout,
+                                 std::chrono::milliseconds idle_timeout) {
     process::ProcessOptions options;
     options.executable = binary;
     options.arguments = arguments;
     options.timeout = timeout;
+    if (idle_timeout > std::chrono::milliseconds::zero()) {
+        options.idle_timeout = idle_timeout;
+    }
 
     process::ProcessResult proc_result = process::run_captured(options);
 
@@ -208,6 +212,7 @@ LlamaRunResult run_llama_binary(const std::filesystem::path& binary,
 
     if (proc_result.outcome == process::ProcessOutcome::TimedOut) {
         result.timed_out = true;
+        result.idle_timed_out = proc_result.idle_timed_out;
         return result;
     }
     if (proc_result.outcome == process::ProcessOutcome::FailedToStart) {

@@ -8,6 +8,7 @@
 
 #include "self_path.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -45,6 +46,20 @@ int run_hidden_mode(int argc, char** argv) {
     if (mode == "--fluxinfer-sleep-ms") {
         if (argc < 3) return 2;
         std::this_thread::sleep_for(std::chrono::milliseconds(std::stoi(argv[2])));
+        return 0;
+    }
+
+    // Prints a line every <interval_ms> for <total_ms>: a process that is
+    // slow but demonstrably alive, used to check that the idle timeout does
+    // not kill work that is still making progress.
+    if (mode == "--fluxinfer-chatty-ms") {
+        if (argc < 4) return 2;
+        const int total_ms = std::stoi(argv[2]);
+        const int interval_ms = std::max(1, std::stoi(argv[3]));
+        for (int elapsed = 0; elapsed < total_ms; elapsed += interval_ms) {
+            std::cout << "still working: " << elapsed << "ms\n" << std::flush;
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+        }
         return 0;
     }
 

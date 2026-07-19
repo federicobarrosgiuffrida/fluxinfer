@@ -32,7 +32,18 @@ struct TunerOptions {
     // platform default, see parameter_space.hpp).
     std::uint64_t vram_headroom_bytes = 0;
 
+    // Lower bound on the per-run total time budget. The effective cap is
+    // scaled up for large models (see kTimeoutMillisPerGiB in tuner.cpp),
+    // because most of a benchmark run on a multi-gigabyte model is spent
+    // loading weights from disk before any work starts.
     std::chrono::milliseconds per_run_timeout{60000};
+
+    // Kill a benchmark that produces no output for this long. This, not the
+    // total cap, is what identifies a genuinely stuck process: an
+    // over-VRAM allocation on Windows/WDDM can leave llama-bench crawling
+    // for minutes without failing, while a healthy run on a large model is
+    // slow but never silent.
+    std::chrono::milliseconds idle_timeout{60000};
     unsigned prompt_tokens_for_bench = 512; // -p
     unsigned gen_tokens_for_bench = 128;    // -n
 

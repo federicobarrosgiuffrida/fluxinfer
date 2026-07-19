@@ -93,8 +93,20 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
     // dominant per-run cost (loading a possibly multi-GB model) is paid
     // once; scaling the timeout by repetitions is a generous but safe
     // ceiling rather than a tight estimate.
-    const auto effective_timeout = options_.per_run_timeout * std::max(1u, repetitions);
-    llama::LlamaRunResult run = llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout);
+    auto effective_timeout = options_.per_run_timeout * std::max(1u, repetitions);
+    // Scale the cap with model size: a 21GB model takes minutes just to be
+    // read off disk, so a fixed budget tuned for a small model reports
+    // "timed out" for runs that were never in trouble. The idle timeout
+    // below is what actually catches hangs, so the cap only needs to be
+    // generous enough not to fire spuriously.
+    constexpr std::int64_t kTimeoutMillisPerGiB = 10000;
+    constexpr std::uint64_t kGiB = 1024ULL * 1024 * 1024;
+    const auto size_based = std::chrono::milliseconds(
+        static_cast<std::int64_t>(model_size_bytes_ / kGiB) * kTimeoutMillisPerGiB * std::max(1u, repetitions));
+    effective_timeout = std::max(effective_timeout, size_based);
+
+    llama::LlamaRunResult run =
+        llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout, options_.idle_timeout);
 
     result.ran = run.outcome != process::ProcessOutcome::FailedToStart;
     result.exit_code = run.exit_code;

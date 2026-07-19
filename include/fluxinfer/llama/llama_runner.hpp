@@ -65,14 +65,24 @@ struct LlamaRunResult {
     bool crashed = false;
     bool timed_out = false;
 
+    // Only meaningful when timed_out: true if the process was killed for
+    // producing no output at all (a real hang), false if it was still
+    // working but exceeded its total budget. Loading a multi-gigabyte model
+    // is slow but not silent, so this separates "stuck" from "big".
+    bool idle_timed_out = false;
+
     bool usable() const { return outcome == process::ProcessOutcome::Exited && !likely_oom && !crashed && exit_code == 0; }
 };
 
 // Invokes `binary` with `arguments` (argv, never shell-interpreted),
 // capturing output and classifying OOM / crash / timeout conditions.
+// `timeout` is the hard cap on total run time. `idle_timeout` (zero =
+// disabled) additionally kills the process if it goes completely silent for
+// that long, which is what a genuine hang looks like.
 LlamaRunResult run_llama_binary(const std::filesystem::path& binary,
                                  const std::vector<std::string>& arguments,
-                                 std::chrono::milliseconds timeout);
+                                 std::chrono::milliseconds timeout,
+                                 std::chrono::milliseconds idle_timeout = std::chrono::milliseconds::zero());
 
 // True if `combined_output` (stdout+stderr) contains a substring typical of
 // a CUDA/host out-of-memory failure. Exposed for unit testing; used

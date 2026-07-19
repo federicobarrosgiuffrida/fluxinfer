@@ -26,6 +26,26 @@ std::set<std::string> detect_supported_flags(const std::filesystem::path& binary
 // detect_supported_flags().
 bool supports_flag(const std::set<std::string>& supported_flags, const std::string& flag);
 
+// Merges FluxInfer's profile-derived argv with raw user arguments passed
+// after `--` on the command line.
+//
+// `profile_args` is what build_config_arguments() produces: a sequence of
+// [flag, value] pairs. Any flag the user also specifies is dropped from the
+// profile side, so the user's value ends up alone on the final command line
+// instead of being appended after FluxInfer's. llama.cpp does resolve such
+// duplicates by "last one wins", but it prints a DEPRECATED warning and the
+// effective configuration becomes hard to read back from the launch log.
+//
+// Both spellings of an option are treated as the same flag (a user passing
+// `-ngl 99` also overrides a profile's `--n-gpu-layers`), as is `--flag=value`
+// syntax.
+//
+// If `overridden_out` is non-null, it receives the profile flag tokens that
+// were dropped, in the order they appeared, so callers can report them.
+std::vector<std::string> merge_user_overrides(const std::vector<std::string>& profile_args,
+                                               const std::vector<std::string>& user_args,
+                                               std::vector<std::string>* overridden_out = nullptr);
+
 // Best-effort extraction of a version/build string from `llama-bench
 // --version` or, failing that, `--help` output. Returns "unknown" if
 // nothing could be determined.

@@ -389,6 +389,20 @@ std::vector<std::string> build_config_arguments(const profiles::Profile& profile
     return args;
 }
 
+// Applies the arguments the user passed after `--`, letting them replace the
+// corresponding profile-derived flags instead of being appended alongside
+// them, and reports on stderr which profile values were overridden so the
+// launch line stays explainable.
+std::vector<std::string> apply_user_overrides(std::vector<std::string> profile_args,
+                                               const std::vector<std::string>& user_args) {
+    std::vector<std::string> overridden;
+    std::vector<std::string> merged = llama::merge_user_overrides(profile_args, user_args, &overridden);
+    if (!overridden.empty()) {
+        std::cerr << "note: user arguments override profile value(s) for: " << join(overridden, ", ") << "\n";
+    }
+    return merged;
+}
+
 // ---------------------------------------------------------------------
 // fluxinfer run <model.gguf> [-- extra args]
 // ---------------------------------------------------------------------
@@ -408,7 +422,7 @@ int cmd_run(const std::string& model_path_str, const std::string& llama_dir_opt,
 
     std::set<std::string> supported_flags = llama::detect_supported_flags(*binaries.llama_cli);
     std::vector<std::string> args = build_config_arguments(profile, supported_flags, model_path);
-    args.insert(args.end(), extra_args.begin(), extra_args.end());
+    args = apply_user_overrides(std::move(args), extra_args);
 
     std::cout << "Launching: " << binaries.llama_cli->string() << " " << join(args, " ") << "\n";
 
@@ -455,7 +469,7 @@ int cmd_serve(const std::string& model_path_str, const std::string& llama_dir_op
         args.push_back("--port");
         args.push_back(std::to_string(port));
     }
-    args.insert(args.end(), extra_args.begin(), extra_args.end());
+    args = apply_user_overrides(std::move(args), extra_args);
 
     std::cout << "Starting llama-server on http://" << host << ":" << port << "\n";
     std::cout << "Launching: " << binaries.llama_server->string() << " " << join(args, " ") << "\n";

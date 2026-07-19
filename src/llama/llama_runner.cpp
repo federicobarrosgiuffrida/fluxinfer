@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <regex>
 
 namespace fluxinfer::llama {
@@ -29,6 +30,36 @@ const std::vector<std::string>& oom_patterns() {
         "unable to allocate backend buffer",
     };
     return patterns;
+}
+
+// Short/long spellings of every option FluxInfer itself puts on a llama.cpp
+// command line, so a user override written either way suppresses ours. Only
+// options FluxInfer emits need an entry here: flags it never generates cannot
+// collide with anything on the profile side.
+const std::vector<std::vector<std::string>>& option_alias_groups() {
+    static const std::vector<std::vector<std::string>> groups = {
+        {"-m", "--model"},
+        {"-t", "--threads"},
+        {"-ngl", "--n-gpu-layers"},
+        {"-b", "--batch-size"},
+        {"-ub", "--ubatch-size"},
+        {"-c", "--ctx-size"},
+        {"-ctk", "--cache-type-k"},
+        {"-ctv", "--cache-type-v"},
+        {"--host"},
+        {"--port"},
+    };
+    return groups;
+}
+
+// "--ctx-size" from "--ctx-size", "--ctx-size=32768" or "" for a non-flag
+// token (a value). A lone "-" or "--" is not treated as a flag.
+std::string flag_token(const std::string& argument) {
+    if (argument.size() < 2 || argument.front() != '-' || argument == "--") {
+        return {};
+    }
+    const std::string::size_type equals = argument.find('=');
+    return equals == std::string::npos ? argument : argument.substr(0, equals);
 }
 
 } // namespace
@@ -73,6 +104,52 @@ std::set<std::string> detect_supported_flags(const std::filesystem::path& binary
 
 bool supports_flag(const std::set<std::string>& supported_flags, const std::string& flag) {
     return supported_flags.find(flag) != supported_flags.end();
+}
+
+std::vector<std::string> merge_user_overrides(const std::vector<std::string>& profile_args,
+                                               const std::vector<std::string>& user_args,
+                                               std::vector<std::string>* overridden_out) {
+    // Every flag the user mentions, expanded to all its known spellings.
+    std::set<std::string> overridden;
+    for (const std::string& argument : user_args) {
+        const std::string token = flag_token(argument);
+        if (token.empty()) {
+            continue;
+        }
+        overridden.insert(token);
+        for (const std::vector<std::string>& group : option_alias_groups()) {
+            if (std::find(group.begin(), group.end(), token) != group.end()) {
+                overridden.insert(group.begin(), group.end());
+            }
+        }
+    }
+
+    std::vector<std::string> merged;
+    merged.reserve(profile_args.size() + user_args.size());
+    for (std::size_t i = 0; i < profile_args.size();) {
+        const std::string& flag = profile_args[i];
+        // FluxInfer emits [flag, value] pairs, but a value is only consumed
+        // when the next token is not itself a flag, so a hypothetical
+        // boolean flag on the profile side is still handled correctly.
+        const bool has_value = (i + 1 < profile_args.size()) && flag_token(profile_args[i + 1]).empty();
+        const std::size_t step = has_value ? 2 : 1;
+
+        if (overridden.count(flag) != 0) {
+            if (overridden_out != nullptr) {
+                overridden_out->push_back(flag);
+            }
+            i += step;
+            continue;
+        }
+        merged.push_back(flag);
+        if (has_value) {
+            merged.push_back(profile_args[i + 1]);
+        }
+        i += step;
+    }
+
+    merged.insert(merged.end(), user_args.begin(), user_args.end());
+    return merged;
 }
 
 std::string detect_llama_version(const std::filesystem::path& llama_bench) {

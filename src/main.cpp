@@ -352,7 +352,16 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
             std::cout << "invalid output\n";
         } else {
             std::cout << "prompt=" << result.prompt_tokens_per_second << " tok/s, gen=" << result.generation_tokens_per_second
-                       << " tok/s, score=" << result.score << "\n";
+                       << " tok/s, score=" << result.score;
+            // The VRAM peak is what the spill guard reasons about. Printing
+            // it makes both a rejected candidate and a suspiciously slow one
+            // explainable from the log alone.
+            if (result.measured_peak_vram_bytes) {
+                std::cout << ", VRAM peak=" << format_gib(*result.measured_peak_vram_bytes);
+            } else {
+                std::cout << ", VRAM peak=unmeasured";
+            }
+            std::cout << "\n";
         }
     };
 

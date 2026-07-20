@@ -480,8 +480,19 @@ TuningOutcome Tuner::run() {
     }
 
     // Stage 3: batch/ubatch, based on the best configuration found so far.
+    // Batch size is not VRAM-neutral: larger batches allocate larger compute
+    // buffers, which on a card already close to full is enough to push the
+    // configuration into the same silent spill the offload stages guard
+    // against. Observed at -c 32768 on an RTX 3060, where batch=2048 halved
+    // generation throughput against the very same expert placement. So the
+    // guard applies here too, against the best configuration so far.
     for (const auto& candidate : batch_ubatch_candidates(psi, best.config)) {
         BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+        if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
+            result.vram_spill_suspected = true;
+            outcome.all_results.push_back(result);
+            continue;
+        }
         outcome.all_results.push_back(result);
         if (result.score > best.score) {
             best = result;
@@ -494,6 +505,13 @@ TuningOutcome Tuner::run() {
             continue; // already measured in an earlier stage
         }
         BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+        // Thread count is not VRAM-neutral on a MoE model either: the
+        // CPU-resident experts' working buffers scale with it.
+        if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
+            result.vram_spill_suspected = true;
+            outcome.all_results.push_back(result);
+            continue;
+        }
         outcome.all_results.push_back(result);
         if (result.score > best.score) {
             best = result;

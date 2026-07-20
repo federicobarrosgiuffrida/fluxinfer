@@ -334,11 +334,14 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     std::cout << "Tuning and serving at context size " << context_length
               << " tokens (override with --context; this is what llama-bench is benchmarked against via -d, and what "
                  "run/serve will launch llama-cli/llama-server with via -c).\n";
+    options.on_rejected = [](const tuner::BenchmarkResult& result) {
+        std::cout << "    ^ rejected: VRAM full and throughput collapsed -- silent spill to system RAM, not a usable\n"
+                     "      configuration. Nothing beyond this point will be tried.\n";
+        (void) result;
+    };
     options.on_result = [](const tuner::BenchmarkResult& result) {
         std::cout << "  [" << result.config.label << "] ";
-        if (result.vram_spill_suspected) {
-            std::cout << "rejected: VRAM full and throughput collapsed (silent spill to system RAM)\n";
-        } else if (result.oom) {
+        if (result.oom) {
             std::cout << "OOM\n";
         } else if (result.crashed) {
             std::cout << "crashed (exit " << result.exit_code << ")\n";

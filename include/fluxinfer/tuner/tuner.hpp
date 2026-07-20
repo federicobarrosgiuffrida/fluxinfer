@@ -97,8 +97,17 @@ struct TunerOptions {
     unsigned search_repetitions = 3;
 
     // Invoked after every completed benchmark run; useful for CLI progress
-    // reporting. May be empty.
+    // reporting. May be empty. Note this fires with the run's *measured*
+    // outcome, before the search decides what to make of it.
     std::function<void(const BenchmarkResult&)> on_result;
+
+    // Invoked when the search rejects a candidate that measured fine but
+    // shows the silent-spill signature (see looks_like_vram_spill). That
+    // verdict is reached by the staged search, after on_result has already
+    // reported the raw numbers, so without this the rejection is invisible
+    // in the log -- the candidate simply appears as a slow result that the
+    // search then mysteriously refuses to climb past. May be empty.
+    std::function<void(const BenchmarkResult&)> on_rejected;
 };
 
 struct TuningOutcome {

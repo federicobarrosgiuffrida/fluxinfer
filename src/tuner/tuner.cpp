@@ -316,6 +316,9 @@ TuningOutcome Tuner::run() {
             if (last_good_result &&
                 looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
                 result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
                 outcome.all_results.push_back(result);
                 oom_layers = candidate.gpu_layers;
                 continue;
@@ -359,6 +362,9 @@ TuningOutcome Tuner::run() {
             if (last_good_result &&
                 looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
                 mid_result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
                 outcome.all_results.push_back(mid_result);
                 oom_layers = midpoint_layers;
                 continue;
@@ -405,6 +411,9 @@ TuningOutcome Tuner::run() {
             if (last_good_result &&
                 looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
                 result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
                 outcome.all_results.push_back(result);
                 failed_ncmoe = ncmoe;
                 continue;
@@ -458,6 +467,9 @@ TuningOutcome Tuner::run() {
             if (last_good_result &&
                 looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
                 mid_result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
                 outcome.all_results.push_back(mid_result);
                 failed_ncmoe = midpoint_ncmoe;
                 continue;
@@ -490,6 +502,9 @@ TuningOutcome Tuner::run() {
         BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
         if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
             result.vram_spill_suspected = true;
+            if (options_.on_rejected) {
+                options_.on_rejected(result);
+            }
             outcome.all_results.push_back(result);
             continue;
         }
@@ -509,6 +524,9 @@ TuningOutcome Tuner::run() {
         // CPU-resident experts' working buffers scale with it.
         if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
             result.vram_spill_suspected = true;
+            if (options_.on_rejected) {
+                options_.on_rejected(result);
+            }
             outcome.all_results.push_back(result);
             continue;
         }

@@ -65,8 +65,14 @@ std::string ask_with_default(const std::string& question, const std::string& fal
     return *answer;
 }
 
-bool ask_yes_no(const std::string& question, bool fallback) {
-    const std::string suffix = fallback ? " [S/n]: " : " [s/N]: ";
+// `explanation` is printed above the question, so the user can decide
+// without knowing llama.cpp's flags beforehand. An empty one is allowed
+// for questions that need no gloss.
+bool ask_yes_no(const std::string& question, const std::string& explanation, bool fallback) {
+    if (!explanation.empty()) {
+        std::cout << "\n  " << explanation << "\n";
+    }
+    const std::string suffix = fallback ? " [Y/n]: " : " [y/N]: ";
     const std::optional<std::string> answer = read_line(question + suffix);
     if (!answer || answer->empty()) {
         return fallback;
@@ -151,9 +157,9 @@ std::optional<std::filesystem::path> choose_model() {
         }
     }
 
-    std::cout << "\n-- Scegli un modello --\n";
+    std::cout << "\n-- Choose a model --\n";
     if (found.empty()) {
-        std::cout << "Nessun .gguf trovato nelle cartelle solite.\n";
+        std::cout << "No .gguf files found in the usual directories.\n";
     } else {
         for (std::size_t i = 0; i < found.size(); ++i) {
             std::error_code ec;
@@ -165,21 +171,21 @@ std::optional<std::filesystem::path> choose_model() {
             std::cout << "\n";
         }
     }
-    std::cout << "  0) inserisci un percorso a mano\n";
+    std::cout << "  0) type a path manually\n";
 
-    const std::optional<std::string> answer = read_line("Scelta: ");
+    const std::optional<std::string> answer = read_line("Choice: ");
     if (!answer) {
         return std::nullopt;
     }
     if (*answer == "0" || found.empty()) {
-        const std::optional<std::string> typed = read_line("Percorso del file .gguf: ");
+        const std::optional<std::string> typed = read_line("Path to the .gguf file: ");
         if (!typed || typed->empty()) {
             return std::nullopt;
         }
         std::filesystem::path path(*typed);
         std::error_code ec;
         if (!std::filesystem::exists(path, ec)) {
-            std::cout << "File non trovato: " << path.string() << "\n";
+            std::cout << "File not found: " << path.string() << "\n";
             return std::nullopt;
         }
         return path;
@@ -193,12 +199,12 @@ std::optional<std::filesystem::path> choose_model() {
     } catch (const std::exception&) {
         // fall through to the error below
     }
-    std::cout << "Scelta non valida.\n";
+    std::cout << "Not a valid choice.\n";
     return std::nullopt;
 }
 
 void show_command(const std::string& command) {
-    std::cout << "\nComando equivalente (puoi usarlo direttamente la prossima volta):\n  " << command << "\n\n";
+    std::cout << "\nEquivalent command (use it directly next time):\n  " << command << "\n\n";
 }
 
 } // namespace
@@ -210,11 +216,17 @@ MenuAction plan_tune(const std::filesystem::path& model) {
     action.kind = MenuAction::Kind::Tune;
     action.model = model;
 
-    std::cout << "\n-- Tuning guidato --\n";
-    std::cout << "Il profilo vale solo per il context a cui lo tuni: usa quello a cui servirai davvero.\n";
-    action.context = ask_with_default("Context (token)", "4096");
-    action.vram_headroom_mb = ask_with_default("VRAM da lasciare libera in MB (0 = predefinito di sistema)", "0");
-    if (ask_yes_no("Generare anche un report dettagliato?", false)) {
+    std::cout << "\n-- Guided tuning --\n";
+    std::cout << "\n  A profile is only valid at the context it was tuned for: a larger context needs more VRAM for the\n"
+                 "  KV cache, which leaves less for the model. Set this to the context you will actually serve at.\n";
+    action.context = ask_with_default("Context (tokens)", "4096");
+    std::cout << "\n  VRAM deliberately left unused, so the tuned configuration still fits once a browser or a chat app is\n"
+                 "  open. Too little here produces a profile that only works on an idle machine.\n";
+    action.vram_headroom_mb = ask_with_default("VRAM headroom in MB (0 = platform default)", "0");
+    if (ask_yes_no("Also write a detailed report?",
+                    "Runs each finalist several more times and writes a markdown report with the spread between runs, "
+                    "so a close result can be told apart from a lucky one. Adds a few minutes.",
+                    false)) {
         action.report_out = "report.md";
     }
     return action;
@@ -225,27 +237,39 @@ MenuAction plan_serve(const std::filesystem::path& model) {
     action.kind = MenuAction::Kind::Serve;
     action.model = model;
 
-    std::cout << "\n-- Avvio server --\n";
-    if (ask_yes_no("Template della chat (--jinja)?", true)) {
+    std::cout << "\n-- Start server --\n";
+    if (ask_yes_no("Use the model's own chat template?",
+                    "--jinja: formats each turn the way this model was trained to expect, and is required for tool "
+                    "calling. Leave on unless you know otherwise.",
+                    true)) {
         action.extra_args.push_back("--jinja");
     }
-    if (ask_yes_no("Disabilitare mmap (consigliato con esperti in RAM)?", true)) {
+    if (ask_yes_no("Load the whole model into RAM up front?",
+                    "--no-mmap: reads the file into memory instead of mapping it. Slower to start, but faster to run "
+                    "when part of the model lives in system RAM, which is the case for offloaded MoE experts.",
+                    true)) {
         action.extra_args.push_back("--no-mmap");
     }
-    if (ask_yes_no("Abilitare il proxy MCP per la web UI?", false)) {
+    if (ask_yes_no("Allow the web UI to use external tools (web search, MCP servers)?",
+                    "--webui-mcp-proxy: lets the built-in UI reach MCP servers, which a browser cannot call directly "
+                    "from a local page. Experimental in llama.cpp; fine for local use.",
+                    false)) {
         action.extra_args.push_back("--webui-mcp-proxy");
     }
-    if (ask_yes_no("Mantenere il ragionamento tra i turni?", false)) {
+    if (ask_yes_no("Keep the model's reasoning between turns?",
+                    "--reasoning-preserve: carries the model's thinking into later turns. Valuable for multi-step "
+                    "agentic work; it also consumes context and makes short replies noticeably slower.",
+                    false)) {
         action.extra_args.push_back("--reasoning-preserve");
     }
     return action;
 }
 
 void list_profiles(const std::filesystem::path& profiles_directory) {
-    std::cout << "\n-- Profili salvati --\n";
+    std::cout << "\n-- Saved profiles --\n";
     std::error_code ec;
     if (!std::filesystem::exists(profiles_directory, ec)) {
-        std::cout << "Nessun profilo in " << profiles_directory.string() << "\n";
+        std::cout << "No profiles in " << profiles_directory.string() << "\n";
         return;
     }
 
@@ -279,12 +303,12 @@ void list_profiles(const std::filesystem::path& profiles_directory) {
             std::cout << " n_cpu_moe=" << *profile->best_config.n_cpu_moe;
         }
         std::cout << " context=" << profile->best_config.context_length << "\n";
-        std::cout << "    misurato: " << profile->results.generation_tps << " tok/s generazione, "
-                  << profile->results.prompt_tps << " tok/s prompt\n";
+        std::cout << "    measured: " << profile->results.generation_tps << " tok/s generation, "
+                  << profile->results.prompt_tps << " tok/s prompt processing\n";
         std::cout << "    hardware: " << profile->hardware.gpu << "\n";
     }
     if (!any) {
-        std::cout << "Nessun profilo valido in " << profiles_directory.string() << "\n";
+        std::cout << "No valid profiles in " << profiles_directory.string() << "\n";
     }
 }
 
@@ -295,13 +319,13 @@ MenuAction run_menu(const std::filesystem::path& profiles_directory) {
         std::cout << "\n===============================\n";
         std::cout << " FluxInfer\n";
         std::cout << "===============================\n";
-        std::cout << "  1) Ottimizza un modello (tune)\n";
-        std::cout << "  2) Avvia il server con un modello gia' ottimizzato\n";
-        std::cout << "  3) Mostra i profili salvati\n";
-        std::cout << "  4) Diagnostica (doctor)\n";
-        std::cout << "  5) Esci\n";
+        std::cout << "  1) Tune a model (find the best configuration)\n";
+        std::cout << "  2) Start the server with an already-tuned model\n";
+        std::cout << "  3) Show saved profiles\n";
+        std::cout << "  4) Diagnostics (doctor)\n";
+        std::cout << "  5) Quit\n";
 
-        const std::optional<std::string> choice = read_line("\nScelta: ");
+        const std::optional<std::string> choice = read_line("\nChoice: ");
         if (!choice || *choice == "5" || *choice == "q") {
             return none;
         }
@@ -348,7 +372,7 @@ MenuAction run_menu(const std::filesystem::path& profiles_directory) {
             show_command("fluxinfer doctor");
             return action;
         }
-        std::cout << "Scelta non riconosciuta.\n";
+        std::cout << "Unrecognised choice.\n";
     }
 }
 

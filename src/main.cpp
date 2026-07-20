@@ -8,6 +8,8 @@
 #include "fluxinfer/profiles/profile.hpp"
 #include "fluxinfer/profiles/profile_store.hpp"
 #include "fluxinfer/tuner/comparison.hpp"
+#include "fluxinfer/tuner/feasibility.hpp"
+#include "fluxinfer/tuner/parameter_space.hpp"
 #include "fluxinfer/tuner/tuner.hpp"
 
 #include <csignal>
@@ -328,6 +330,23 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     options.moe_tuning_enabled = !no_moe_tune;
     options.per_run_timeout = std::chrono::seconds(timeout_seconds);
     options.vram_headroom_bytes = static_cast<std::uint64_t>(vram_headroom_mb) * 1024ULL * 1024ULL;
+
+    // Say up front whether this combination can work at all. A tuning run
+    // costs tens of minutes on a large model; discovering at the end that
+    // nothing could ever have fitted is a poor way to spend them.
+    {
+        const std::uint64_t headroom_for_estimate =
+            options.vram_headroom_bytes > 0 ? options.vram_headroom_bytes : tuner::default_vram_headroom_bytes();
+        const tuner::FitEstimate fit = tuner::estimate_fit(model_info->size_bytes, gguf.metadata, context_length, hw,
+                                                            headroom_for_estimate);
+        if (fit.is_problem()) {
+            std::cerr << "\nWARNING: " << fit.explanation << "\n"
+                      << "Tuning will run anyway -- this is an estimate, not a measurement, and estimates can be wrong.\n"
+                      << "If every configuration fails, this is why.\n\n";
+        } else {
+            std::cout << "Fit estimate: " << fit.explanation << "\n";
+        }
+    }
     options.idle_timeout = std::chrono::seconds(idle_timeout_seconds);
     options.search_repetitions = std::max(1u, search_repetitions);
     options.context_length = context_length;

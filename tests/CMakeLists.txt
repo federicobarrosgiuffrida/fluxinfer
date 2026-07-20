@@ -18,6 +18,7 @@ add_executable(fluxinfer_tests
     test_scoring.cpp
     test_parameter_space.cpp
     test_profile.cpp
+    test_feasibility.cpp
     test_gguf_metadata.cpp
     test_comparison_stats.cpp
 )

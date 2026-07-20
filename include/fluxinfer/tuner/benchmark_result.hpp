@@ -16,6 +16,10 @@ struct BenchmarkResult {
     bool ran = false; // process was launched and returned (not FailedToStart)
     int exit_code = -1;
     bool timed_out = false;
+    // Only meaningful with timed_out: true when the process was killed for
+    // going silent (a stall), false when it was still producing output and
+    // merely exceeded its total budget. See LlamaRunResult::idle_timed_out.
+    bool idle_timed_out = false;
     bool crashed = false;
     bool oom = false;
     bool output_valid = false; // benchmark_parser could extract tok/s figures

@@ -343,7 +343,11 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
         } else if (result.crashed) {
             std::cout << "crashed (exit " << result.exit_code << ")\n";
         } else if (result.timed_out) {
-            std::cout << "timed out\n";
+            // Which limit fired matters when reading a search afterwards:
+            // "idle" means the process went silent (stalled -- on Windows
+            // typically an over-VRAM allocation), "total" means it was
+            // working the whole time and simply too slow.
+            std::cout << "timed out (" << (result.idle_timed_out ? "went silent" : "exceeded total budget") << ")\n";
         } else if (!result.output_valid) {
             std::cout << "invalid output\n";
         } else {

@@ -126,6 +126,7 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
     result.ran = run.outcome != process::ProcessOutcome::FailedToStart;
     result.exit_code = run.exit_code;
     result.timed_out = run.timed_out;
+    result.idle_timed_out = run.idle_timed_out;
     result.crashed = run.crashed;
     result.oom = run.likely_oom;
     result.duration = run.duration;
@@ -356,7 +357,8 @@ TuningOutcome Tuner::run() {
         std::vector<TuneConfig> candidates = n_cpu_moe_candidates(psi, baseline);
 
         int last_good_ncmoe = -1;
-        int failed_ncmoe = -1; // lowest value known to fail; nothing below it is tried
+        int failed_ncmoe = -1;         // lowest value known to fail outright (OOM/spill)
+        int lowest_failed_ncmoe = -1;  // lowest value that failed inconclusively (timeout/crash)
         std::optional<BenchmarkResult> last_good_result;
         for (const auto& candidate : candidates) {
             const int ncmoe = candidate.n_cpu_moe.value_or(0);
@@ -382,7 +384,26 @@ TuningOutcome Tuner::run() {
                 if (result.score > best.score) {
                     best = result;
                 }
+            } else {
+                // Timed out or crashed: not proof of an OOM, so it does not
+                // stop the sweep the way a confirmed OOM does -- but it is
+                // still the lowest value known *not* to work, which is
+                // exactly what the bisection below needs as a floor.
+                // Without this, a Windows machine (where an over-VRAM MoE
+                // configuration stalls instead of reporting OOM) never
+                // refines at all: observed on an RTX 3060, where the sweep
+                // stopped at the coarse grid and left the real optimum
+                // between two probes unexplored.
+                if (lowest_failed_ncmoe < 0 || ncmoe < lowest_failed_ncmoe) {
+                    lowest_failed_ncmoe = ncmoe;
+                }
             }
+        }
+
+        // Refine against whichever floor is known: a confirmed OOM/spill if
+        // there is one, otherwise the lowest inconclusive failure.
+        if (failed_ncmoe < 0) {
+            failed_ncmoe = lowest_failed_ncmoe;
         }
 
         // Same bounded refinement as the dense search, mirrored: here the

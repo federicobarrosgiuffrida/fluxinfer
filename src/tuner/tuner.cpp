@@ -559,6 +559,64 @@ TuningOutcome Tuner::run() {
     }
 
     outcome.best = best;
+    // Stage 5: revisit the offload axis under the batch and thread settings
+    // the later stages chose.
+    //
+    // The search optimises one axis at a time, but the axes are not
+    // independent: batch size and thread count both move VRAM usage, so the
+    // expert placement (or GPU layer count) picked in stage 2 was chosen
+    // under conditions that no longer hold. Measured on an RTX 3060, a
+    // batch chosen after the offload was enough to push a configuration
+    // into a spill it had been clear of.
+    //
+    // A full second search would double the runtime, so this is a bounded
+    // re-probe: the immediate neighbours of the current value, under the
+    // final settings, keeping whichever wins. It cannot make the result
+    // worse -- a neighbour is only adopted if it scores higher -- and it
+    // costs two runs.
+    if (best.usable() && (moe_stage_enabled || gpu_layers_stage_enabled)) {
+        const bool moe_axis = best.config.n_cpu_moe.has_value();
+        const int current = moe_axis ? *best.config.n_cpu_moe : best.config.gpu_layers;
+        const auto total_layers = static_cast<int>(options_.real_layer_count.value_or(0));
+
+        std::vector<int> neighbours;
+        if (current - 1 >= 0) {
+            neighbours.push_back(current - 1);
+        }
+        if (current + 1 <= total_layers) {
+            neighbours.push_back(current + 1);
+        }
+
+        for (int value : neighbours) {
+            TuneConfig candidate = best.config;
+            if (moe_axis) {
+                candidate.n_cpu_moe = value;
+                candidate.label = "n_cpu_moe=" + std::to_string(value) + " (recheck at final batch/threads)";
+            } else {
+                candidate.gpu_layers = value;
+                candidate.label = "gpu_layers=" + std::to_string(value) + " (recheck at final batch/threads)";
+            }
+
+            BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            const bool rejected =
+                looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom) ||
+                (result.usable() && exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom));
+            if (rejected) {
+                result.vram_spill_suspected = !exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom);
+                result.vram_headroom_exceeded = !result.vram_spill_suspected;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                outcome.all_results.push_back(result);
+                continue;
+            }
+            outcome.all_results.push_back(result);
+            if (result.usable() && result.score > best.score) {
+                best = result;
+            }
+        }
+    }
+
     if (!best.usable()) {
         outcome.success = false;
         outcome.error = "every benchmark configuration failed (OOM, crash, timeout or invalid output)";

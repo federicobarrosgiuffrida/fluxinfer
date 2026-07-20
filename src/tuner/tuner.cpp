@@ -83,12 +83,42 @@ std::vector<std::string> Tuner::build_arguments(const TuneConfig& config, unsign
         }
     }
 
+    // Ask llama-bench to announce each phase. Without this it is silent
+    // until the very end in JSON mode, which makes an idle timeout
+    // meaningless (it would only measure total runtime, badly).
+    if (llama::supports_flag(options_.supported_flags, "--progress")) {
+        args.push_back("--progress");
+    }
+
     if (llama::supports_flag(options_.supported_flags, "--output")) {
         args.push_back("-o");
         args.push_back("json");
     }
 
     return args;
+}
+
+std::chrono::milliseconds Tuner::effective_idle_timeout() const {
+    // Silence only means "stuck" if llama-bench would otherwise be talking.
+    if (!llama::supports_flag(options_.supported_flags, "--progress")) {
+        return std::chrono::milliseconds::zero();
+    }
+    if (options_.idle_timeout <= std::chrono::milliseconds::zero()) {
+        return std::chrono::milliseconds::zero();
+    }
+
+    // The longest legitimately silent phase is the depth prefill: it
+    // processes `context_length` tokens in one go, with no output until it
+    // finishes. Budget it at a deliberately pessimistic floor for
+    // prompt-processing throughput -- well below anything measured on real
+    // hardware (the worst observed on an RTX 3060 was ~77 tok/s, and that
+    // was already a machine in trouble) -- so a healthy prefill is never
+    // mistaken for a hang, while a truly stuck process is still caught in
+    // bounded time.
+    constexpr double kPessimisticPromptTokensPerSecond = 25.0;
+    const auto prefill_budget = std::chrono::milliseconds(
+        static_cast<std::int64_t>(1000.0 * options_.context_length / kPessimisticPromptTokensPerSecond));
+    return std::max(options_.idle_timeout, prefill_budget);
 }
 
 BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, bool disable_warmup) {
@@ -110,7 +140,13 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
     constexpr std::uint64_t kGiB = 1024ULL * 1024 * 1024;
     const auto size_based = std::chrono::milliseconds(
         static_cast<std::int64_t>(model_size_bytes_ / kGiB) * kTimeoutMillisPerGiB * std::max(1u, repetitions));
-    effective_timeout = std::max(effective_timeout, size_based);
+    // The same prefill the idle window accounts for also has to fit inside
+    // the total budget, or the cap simply replaces the idle timeout as the
+    // thing that kills healthy runs.
+    constexpr double kPessimisticPromptTokensPerSecond = 25.0;
+    const auto prefill_budget = std::chrono::milliseconds(
+        static_cast<std::int64_t>(1000.0 * options_.context_length / kPessimisticPromptTokensPerSecond));
+    effective_timeout = std::max(effective_timeout, size_based + prefill_budget);
 
     // Measure what the card is actually doing during the run. The sampler
     // is GPU-wide and coarse (see VramSampler), which is the right scope
@@ -119,7 +155,7 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
     hardware::VramSampler sampler;
     sampler.start();
     llama::LlamaRunResult run =
-        llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout, options_.idle_timeout);
+        llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout, effective_idle_timeout());
     sampler.stop();
     result.measured_peak_vram_bytes = sampler.peak_used_bytes();
 

@@ -47,11 +47,19 @@ struct TunerOptions {
     // loading weights from disk before any work starts.
     std::chrono::milliseconds per_run_timeout{60000};
 
-    // Kill a benchmark that produces no output for this long. This, not the
-    // total cap, is what identifies a genuinely stuck process: an
-    // over-VRAM allocation on Windows/WDDM can leave llama-bench crawling
-    // for minutes without failing, while a healthy run on a large model is
-    // slow but never silent.
+    // Kill a benchmark that produces no output for this long -- but only
+    // when llama-bench can actually be made to talk (--progress). In JSON
+    // output mode llama-bench prints nothing at all until the whole run is
+    // over, so silence carries no information: with --progress it marks
+    // each phase (load, warmup, depth prefill, prompt, generation), and
+    // silence *within* a phase is what a stall looks like.
+    //
+    // The effective window is widened for the work a phase can legitimately
+    // take (see effective_idle_timeout() in tuner.cpp): prefilling a large
+    // context is a single silent phase that scales with --context, and a
+    // fixed 60s window fails every candidate on a big model at a big
+    // context -- observed on an RTX 3060 at -c 32768, where all eleven
+    // candidates were killed while working normally.
     std::chrono::milliseconds idle_timeout{60000};
     unsigned prompt_tokens_for_bench = 512; // -p
     unsigned gen_tokens_for_bench = 128;    // -n
@@ -137,6 +145,10 @@ private:
     BenchmarkResult run_one(const TuneConfig& config, unsigned repetitions, bool disable_warmup);
     std::vector<std::string> build_arguments(const TuneConfig& config, unsigned repetitions, bool disable_warmup) const;
     bool ensure_initialized(std::string* error);
+    // Idle window actually applied to a run: zero (disabled) unless
+    // llama-bench supports --progress, and widened to cover the silent
+    // depth-prefill phase at the configured context size.
+    std::chrono::milliseconds effective_idle_timeout() const;
 
     TunerOptions options_;
     std::uint64_t model_size_bytes_ = 0;

@@ -1,6 +1,7 @@
 #include <CLI11/CLI11.hpp>
 
 #include "fluxinfer/hardware/hardware_info.hpp"
+#include "fluxinfer/menu.hpp"
 #include "fluxinfer/llama/gguf_metadata.hpp"
 #include "fluxinfer/llama/llama_locator.hpp"
 #include "fluxinfer/llama/llama_runner.hpp"
@@ -686,6 +687,9 @@ int main(int argc, char** argv) {
     unsigned compare_repeats = 0;
     unsigned warmup_runs = 1;
     std::string report_out;
+    CLI::App* menu_cmd = app.add_subcommand("menu", "Interactive menu: pick a model and an action without typing flags");
+    add_common_options(menu_cmd);
+
     CLI::App* doctor_cmd = app.add_subcommand("doctor", "Diagnose the llama.cpp build, its capabilities and the GPU setup");
     add_common_options(doctor_cmd);
 
@@ -743,6 +747,24 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (*menu_cmd) {
+        const menu::MenuAction action = menu::run_menu(profiles_dir_opt.empty() ? std::filesystem::path("profiles") : std::filesystem::path(profiles_dir_opt));
+        switch (action.kind) {
+        case menu::MenuAction::Kind::Tune:
+            return cmd_tune(action.model.string(), llama_dir_opt, profiles_dir_opt, tune_timeout_seconds,
+                             search_repetitions, static_cast<unsigned>(std::stoul(action.context)), compare_repeats,
+                             static_cast<unsigned>(std::stoul(action.vram_headroom_mb)), tune_idle_timeout_seconds,
+                             no_moe_tune, warmup_runs, action.report_out);
+        case menu::MenuAction::Kind::Serve:
+            return cmd_serve(action.model.string(), llama_dir_opt, profiles_dir_opt, serve_host, serve_port,
+                              action.extra_args);
+        case menu::MenuAction::Kind::Doctor:
+            return cmd_doctor(llama_dir_opt);
+        case menu::MenuAction::Kind::None:
+            return 0;
+        }
+        return 0;
+    }
     if (*doctor_cmd) {
         return cmd_doctor(llama_dir_opt);
     }

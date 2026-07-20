@@ -56,6 +56,24 @@ Otherwise, only a C++20 compiler and CMake ≥ 3.20 are required. On Windows,
 GPU detection additionally links `pdh.lib` (part of the Windows SDK); on
 Linux it links `pthread` and `dl` for dynamic NVML loading.
 
+## Quick start (Windows)
+
+If you just want to run a model and would rather not build anything:
+
+```powershell
+irm https://raw.githubusercontent.com/federicobarrosgiuffrida/fluxinfer/master/scripts/install.ps1 | iex
+```
+
+[`scripts/install.ps1`](scripts/install.ps1) downloads a published
+FluxInfer release and a CUDA build of llama.cpp (plus the CUDA runtime
+DLLs those need), points `FLUXINFER_LLAMA_DIR` at them, adds `fluxinfer`
+to `PATH`, and opens the interactive menu. It compiles nothing and needs
+neither Visual Studio nor CMake.
+
+It does not install an NVIDIA driver or a model: it checks for both and
+tells you what is missing. Building from source is still the supported
+path for development, and is described below.
+
 ## Building
 
 ### Windows

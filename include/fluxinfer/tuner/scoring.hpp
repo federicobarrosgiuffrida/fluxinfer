@@ -58,4 +58,23 @@ double compute_score(const BenchmarkResult& result, std::uint64_t available_ram_
 bool looks_like_vram_spill(const BenchmarkResult& candidate, const BenchmarkResult& reference,
                             std::uint64_t total_vram_bytes, std::uint64_t headroom_bytes);
 
+// True when `result` measured well but left less than `headroom_bytes` of
+// VRAM free, i.e. it only fits on a machine in the exact state it was
+// benchmarked in.
+//
+// looks_like_vram_spill() catches a configuration that already collapsed.
+// This catches the one that has not collapsed *yet*: benchmarking happens
+// on a comparatively idle machine, while the tuned profile is used on a
+// working one, with a browser, a chat client and a desktop compositor
+// holding VRAM that was free during the search. A configuration with no
+// margin is therefore not a good configuration, even when it posts the
+// best numbers in the search.
+//
+// Measured on an RTX 3060 12GB (Qwen3.6-35B-A3B, -c 32768): the search
+// selected --n-cpu-moe 21, whose benchmark peak left the card essentially
+// full, and it did benchmark fastest. In day-to-day use with a browser
+// open it served at 35.2 tok/s, while --n-cpu-moe 24 -- rejected by the
+// search for being slightly slower on an idle machine -- served at 39.0.
+bool exceeds_vram_headroom(const BenchmarkResult& result, std::uint64_t total_vram_bytes, std::uint64_t headroom_bytes);
+
 } // namespace fluxinfer::tuner

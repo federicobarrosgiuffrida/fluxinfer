@@ -86,4 +86,15 @@ bool looks_like_vram_spill(const BenchmarkResult& candidate, const BenchmarkResu
     return generation_collapsed || prompt_collapsed;
 }
 
+bool exceeds_vram_headroom(const BenchmarkResult& result, std::uint64_t total_vram_bytes, std::uint64_t headroom_bytes) {
+    if (!result.measured_peak_vram_bytes || total_vram_bytes == 0 || headroom_bytes == 0) {
+        return false; // no measurement, no verdict
+    }
+    const std::uint64_t peak = *result.measured_peak_vram_bytes;
+    if (peak > total_vram_bytes) {
+        return false; // nonsensical sample
+    }
+    return (total_vram_bytes - peak) < headroom_bytes;
+}
+
 } // namespace fluxinfer::tuner

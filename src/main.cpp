@@ -335,9 +335,13 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
               << " tokens (override with --context; this is what llama-bench is benchmarked against via -d, and what "
                  "run/serve will launch llama-cli/llama-server with via -c).\n";
     options.on_rejected = [](const tuner::BenchmarkResult& result) {
-        std::cout << "    ^ rejected: VRAM full and throughput collapsed -- silent spill to system RAM, not a usable\n"
-                     "      configuration. Nothing beyond this point will be tried.\n";
-        (void) result;
+        if (result.vram_headroom_exceeded) {
+            std::cout << "    ^ rejected: fast, but leaves no VRAM headroom -- it would fit this machine while idle,\n"
+                         "      not while you are using it. Keeping the last configuration with margin.\n";
+        } else {
+            std::cout << "    ^ rejected: VRAM full and throughput collapsed -- silent spill to system RAM, not a usable\n"
+                         "      configuration. Nothing beyond this point will be tried.\n";
+        }
     };
     options.on_result = [](const tuner::BenchmarkResult& result) {
         std::cout << "  [" << result.config.label << "] ";

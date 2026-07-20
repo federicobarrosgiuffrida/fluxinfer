@@ -167,3 +167,25 @@ TEST_CASE("looks_like_vram_spill does not flag healthy configurations", "[scorin
         CHECK_FALSE(looks_like_vram_spill(crashed, healthy, kTotalVram, kHeadroom));
     }
 }
+
+TEST_CASE("exceeds_vram_headroom rejects configurations with no margin", "[scoring][spill]") {
+    // Real case: --n-cpu-moe 21 peaked at 12.0GB of a 12GB card during the
+    // search, benchmarked fastest, and then served ~10% slower than a
+    // configuration with margin once the machine was actually in use.
+    CHECK(exceeds_vram_headroom(make_run(138.7, 38.7, 12280), kTotalVram, kHeadroom));
+
+    SECTION("a configuration with margin is accepted") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(136.5, 37.9, 10500), kTotalVram, kHeadroom));
+    }
+    SECTION("exactly at the headroom boundary is still acceptable") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(136.5, 37.9, 12288 - 1536), kTotalVram, kHeadroom));
+    }
+    SECTION("no measurement means no verdict") {
+        BenchmarkResult unmeasured = make_run(138.7, 38.7, 12280);
+        unmeasured.measured_peak_vram_bytes.reset();
+        CHECK_FALSE(exceeds_vram_headroom(unmeasured, kTotalVram, kHeadroom));
+    }
+    SECTION("headroom disabled means no verdict") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(138.7, 38.7, 12280), kTotalVram, 0));
+    }
+}

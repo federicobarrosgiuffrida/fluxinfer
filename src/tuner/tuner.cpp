@@ -423,6 +423,19 @@ TuningOutcome Tuner::run() {
                 failed_ncmoe = ncmoe;
                 continue;
             }
+            if (result.usable() && best.usable() &&
+                exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                // Fast, but with no VRAM to spare: it fits this machine in
+                // this moment, not the machine the profile will be used on.
+                // Treated as the boundary, so the search keeps the last
+                // configuration that still had margin.
+                result.vram_headroom_exceeded = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                failed_ncmoe = ncmoe;
+                continue;
+            }
             if (result.usable()) {
                 last_good_ncmoe = ncmoe;
                 last_good_result = result;
@@ -475,6 +488,15 @@ TuningOutcome Tuner::run() {
                 continue;
             }
             outcome.all_results.push_back(mid_result);
+            if (mid_result.usable() && best.usable() &&
+                exceeds_vram_headroom(mid_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_headroom_exceeded = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
+                failed_ncmoe = midpoint_ncmoe;
+                continue;
+            }
             if (mid_result.usable()) {
                 last_good_ncmoe = midpoint_ncmoe;
                 last_good_result = mid_result;

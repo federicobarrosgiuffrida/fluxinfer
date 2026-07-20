@@ -56,6 +56,11 @@ struct BenchmarkResult {
     // usable candidate.
     bool vram_spill_suspected = false;
 
+    // Set when a run measured fine but left less VRAM free than the
+    // configured headroom: it fits the benchmark machine, not the working
+    // one. Not promoted to best while a configuration with margin exists.
+    bool vram_headroom_exceeded = false;
+
     std::chrono::milliseconds duration{0};
     double score = 0.0;
 

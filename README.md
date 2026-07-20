@@ -18,8 +18,8 @@ Hardware detection, real GGUF metadata discovery, a staged benchmark search
 driven by the model's actual layer count, a MoE-aware expert-placement
 search (`--n-cpu-moe`), measured peak-VRAM sampling with silent-spill
 rejection, profile persistence, a reproducible repeated-measurement
-comparison report, and the five subcommands (`inspect`, `doctor`, `tune`,
-`run`, `serve`). It has not been used in
+comparison report, a pre-flight fit estimate, an interactive menu, and the
+six subcommands (`menu`, `inspect`, `doctor`, `tune`, `run`, `serve`). It has not been used in
 production. Interfaces (CLI flags, profile JSON schema) may still change.
 
 **Tested on:** one machine, two models, one GPU — Qwen3.5-9B (dense, Q8_0)
@@ -136,6 +136,7 @@ it.
 ## Usage
 
 ```bash
+fluxinfer menu     # interactive: pick a model and an action, no flags to remember
 fluxinfer inspect
 fluxinfer doctor
 fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--idle-timeout SECONDS] [--llama-dir DIR]
@@ -435,6 +436,17 @@ model. See `compute_model_info()` in
   linear-attention/SSM-style "Gated Delta Net" block), llama.cpp forces at
   least one tensor onto CPU regardless of `-ngl` — so "N GPU layers" isn't
   always as uniform a knob as the search assumes.
+- The staged search optimises one axis at a time and the axes are not
+  independent: batch size and thread count both move VRAM usage, so an
+  offload value chosen before them can be invalidated by them. Since
+  0.4.0 a bounded second pass re-probes the offload value's immediate
+  neighbours under the final batch/thread settings, which narrows the
+  problem but does not make the search jointly optimal.
+- The fit estimate printed before tuning is arithmetic on weights, KV
+  cache and a flat overhead allowance -- not a model of llama.cpp's
+  allocator. It is meant to catch the obviously-impossible case, warns
+  rather than blocks, and says so when the model's metadata is too
+  incomplete to estimate at all.
 - No Bayesian optimization or other adaptive search — the staged search is
   fixed and coarse by design (see [Roadmap](#roadmap)). It does now run
   each candidate with `-r <search-repetitions>` (default 3) and score the

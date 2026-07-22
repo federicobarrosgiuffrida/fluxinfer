@@ -206,6 +206,31 @@ std::optional<std::filesystem::path> choose_model() {
     return std::nullopt;
 }
 
+// Cheap check for the menu's guidance only: is there any saved profile
+// whose filename starts with this model's stem? The real validity check
+// still happens in serve (fingerprint, hardware, llama.cpp version); this
+// just lets the menu tell an untuned user to run Tune first instead of
+// letting serve fail with a raw "no usable tuning profile" error.
+bool has_profile_for(const std::filesystem::path& model, const std::filesystem::path& profiles_directory) {
+    std::error_code ec;
+    if (!std::filesystem::exists(profiles_directory, ec)) {
+        return false;
+    }
+    const std::string stem = model.stem().string();
+    for (const auto& entry : std::filesystem::directory_iterator(profiles_directory, ec)) {
+        if (ec) {
+            break;
+        }
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+        if (entry.path().filename().string().rfind(stem, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void show_command(const std::string& command) {
     std::cout << "\nEquivalent command (use it directly next time):\n  " << command << "\n\n";
 }
@@ -358,6 +383,12 @@ MenuAction run_menu(const std::filesystem::path& profiles_directory) {
             const std::optional<std::filesystem::path> model = choose_model();
             if (!model) {
                 continue;
+            }
+            if (!has_profile_for(*model, profiles_directory)) {
+                std::cout << "\nThis model has not been tuned yet, so there is no configuration to start it with.\n"
+                             "Choose 1) Tune for it first -- that finds the best settings and saves them; then 2) will\n"
+                             "start the server using them.\n";
+                continue; // back to the menu
             }
             MenuAction action = plan_serve(*model);
             std::string command = "fluxinfer serve \"" + model->string() + "\"";

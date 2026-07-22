@@ -172,9 +172,12 @@ std::optional<std::filesystem::path> choose_model() {
         }
     }
     std::cout << "  0) type a path manually\n";
+    std::cout << "  b) back to the menu\n";
 
-    const std::optional<std::string> answer = read_line("Choice: ");
-    if (!answer) {
+    const std::optional<std::string> answer = read_line("Choice (Enter = back): ");
+    // Empty input, "b", or EOF all mean "cancel, return to the menu" -- not
+    // an error, so nothing is printed and the caller loops back cleanly.
+    if (!answer || answer->empty() || *answer == "b" || *answer == "B") {
         return std::nullopt;
     }
     if (*answer == "0" || found.empty()) {
@@ -334,6 +337,11 @@ MenuAction run_menu(const std::filesystem::path& profiles_directory) {
             const std::optional<std::filesystem::path> model = choose_model();
             if (!model) {
                 continue;
+            }
+            std::cout << "\nAbout to tune " << model->filename().string()
+                      << ". This can take from minutes to about an hour.\n";
+            if (!ask_yes_no("Continue?", "", true)) {
+                continue; // back to the menu, nothing started
             }
             MenuAction action = plan_tune(*model);
             std::string command = "fluxinfer tune \"" + model->string() + "\" --context " + action.context;

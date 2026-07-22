@@ -748,22 +748,31 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     if (*menu_cmd) {
-        const menu::MenuAction action = menu::run_menu(profiles_dir_opt.empty() ? std::filesystem::path("profiles") : std::filesystem::path(profiles_dir_opt));
-        switch (action.kind) {
-        case menu::MenuAction::Kind::Tune:
-            return cmd_tune(action.model.string(), llama_dir_opt, profiles_dir_opt, tune_timeout_seconds,
-                             search_repetitions, static_cast<unsigned>(std::stoul(action.context)), compare_repeats,
-                             static_cast<unsigned>(std::stoul(action.vram_headroom_mb)), tune_idle_timeout_seconds,
-                             no_moe_tune, warmup_runs, action.report_out);
-        case menu::MenuAction::Kind::Serve:
-            return cmd_serve(action.model.string(), llama_dir_opt, profiles_dir_opt, serve_host, serve_port,
-                              action.extra_args);
-        case menu::MenuAction::Kind::Doctor:
-            return cmd_doctor(llama_dir_opt);
-        case menu::MenuAction::Kind::None:
-            return 0;
+        const std::filesystem::path profiles_path =
+            profiles_dir_opt.empty() ? std::filesystem::path("profiles") : std::filesystem::path(profiles_dir_opt);
+        // Loop so that actions which are meant to be repeatable -- doctor --
+        // return to the menu instead of ending the program. Tune and serve
+        // are terminal: they hand control to a long-running llama.cpp
+        // process, so they exit the loop.
+        for (;;) {
+            const menu::MenuAction action = menu::run_menu(profiles_path);
+            switch (action.kind) {
+            case menu::MenuAction::Kind::Tune:
+                return cmd_tune(action.model.string(), llama_dir_opt, profiles_dir_opt, tune_timeout_seconds,
+                                 search_repetitions, static_cast<unsigned>(std::stoul(action.context)), compare_repeats,
+                                 static_cast<unsigned>(std::stoul(action.vram_headroom_mb)), tune_idle_timeout_seconds,
+                                 no_moe_tune, warmup_runs, action.report_out);
+            case menu::MenuAction::Kind::Serve:
+                return cmd_serve(action.model.string(), llama_dir_opt, profiles_dir_opt, serve_host, serve_port,
+                                  action.extra_args);
+            case menu::MenuAction::Kind::Doctor:
+                cmd_doctor(llama_dir_opt);
+                std::cout << "\n";
+                continue; // back to the menu
+            case menu::MenuAction::Kind::None:
+                return 0;
+            }
         }
-        return 0;
     }
     if (*doctor_cmd) {
         return cmd_doctor(llama_dir_opt);

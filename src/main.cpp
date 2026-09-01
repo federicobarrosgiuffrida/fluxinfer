@@ -278,6 +278,20 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
              unsigned warmup_runs, const std::string& report_out_opt) {
     const std::filesystem::path model_path(model_path_str);
 
+    // Before anything expensive: make sure the result will have somewhere to
+    // go. Tuning a large model costs tens of minutes, and a profile that
+    // cannot be written at the end takes all of it with it.
+    {
+        const profiles::ProfileStore store(profiles_dir_opt);
+        std::string writable_error;
+        if (!store.check_writable(&writable_error)) {
+            std::cerr << "error: " << writable_error << "\n"
+                      << "\nRefusing to start: the tuning result could not be saved when it finished.\n"
+                      << "Use --profiles-dir to write the profile somewhere else.\n";
+            return 1;
+        }
+    }
+
     std::string model_error;
     std::optional<profiles::ModelInfo> model_info = profiles::compute_model_info(model_path, &model_error);
     if (!model_info) {
@@ -419,18 +433,28 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     profile.results.duration_ms = best.duration.count();
     profile.results.score = best.score;
 
+    // Print the result *before* trying to persist it. If saving fails, the
+    // configuration the search just spent tens of minutes finding is still on
+    // screen, and can be re-entered by hand rather than lost.
+    std::cout << "\nBest configuration: " << best.config.label << "\n";
+    std::cout << "  threads=" << best.config.threads << " gpu_layers=" << best.config.gpu_layers
+               << " batch=" << best.config.batch_size << " ubatch=" << best.config.ubatch_size;
+    if (profile.best_config.n_cpu_moe) {
+        std::cout << " n_cpu_moe=" << *profile.best_config.n_cpu_moe;
+    }
+    std::cout << " context=" << context_length << "\n";
+    std::cout << "  prompt=" << best.prompt_tokens_per_second << " tok/s, generation=" << best.generation_tokens_per_second
+               << " tok/s, score=" << best.score << "\n";
+
     profiles::ProfileStore store(profiles_dir_opt);
     std::string save_error;
     if (!store.save(profile, &save_error)) {
-        std::cerr << "error: could not save profile: " << save_error << "\n";
+        std::cerr << "\nerror: could not save profile: " << save_error << "\n"
+                  << "\nThe configuration above is the result of this run -- it is not lost, only unsaved.\n"
+                  << "Re-run with --profiles-dir pointing somewhere writable to save it without tuning again.\n";
         return 1;
     }
 
-    std::cout << "\nBest configuration: " << best.config.label << "\n";
-    std::cout << "  threads=" << best.config.threads << " gpu_layers=" << best.config.gpu_layers
-               << " batch=" << best.config.batch_size << " ubatch=" << best.config.ubatch_size << "\n";
-    std::cout << "  prompt=" << best.prompt_tokens_per_second << " tok/s, generation=" << best.generation_tokens_per_second
-               << " tok/s, score=" << best.score << "\n";
     std::cout << "Profile saved to " << store.profile_path_for(profile.model).string() << "\n";
 
     if (compare_repeats > 0) {
@@ -759,7 +783,8 @@ int main(int argc, char** argv) {
             switch (action.kind) {
             case menu::MenuAction::Kind::Tune:
                 return cmd_tune(action.model.string(), llama_dir_opt, profiles_dir_opt, tune_timeout_seconds,
-                                 search_repetitions, static_cast<unsigned>(std::stoul(action.context)), compare_repeats,
+                                 search_repetitions, static_cast<unsigned>(std::stoul(action.context)),
+                                 static_cast<unsigned>(std::stoul(action.compare_repeats)),
                                  static_cast<unsigned>(std::stoul(action.vram_headroom_mb)), tune_idle_timeout_seconds,
                                  no_moe_tune, warmup_runs, action.report_out);
             case menu::MenuAction::Kind::Serve:

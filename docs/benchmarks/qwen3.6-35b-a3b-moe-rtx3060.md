@@ -90,6 +90,16 @@ manual optimum of ~40-45 tok/s at `--n-cpu-moe 24`. The automatic search
 took under an hour; the manual sweep took an afternoon of a person's
 attention.
 
+> **Note added later in this branch.** This run predates the VRAM-headroom
+> guard. The selected configuration peaks at 11.8 GB on a 12 GB card, leaving
+> roughly 0.2 GB free, and the guard added afterwards rejects exactly that:
+> it served measurably worse than a lower setting once a browser was open.
+> Re-run with the guard in place, the search stops at `--n-cpu-moe 27`
+> (9.6 GB peak, ~2.4 GB free) and reports 37.7 tok/s generation / 340 tok/s
+> prompt processing. The ~11% of generation throughput between the two
+> numbers is the price of a configuration that still fits while the machine
+> is being used, which is the tradeoff this branch argues for.
+
 Three things are worth reading carefully here:
 
 **The measured VRAM curve is monotonic and lands exactly on the card's

@@ -256,6 +256,7 @@ MenuAction plan_tune(const std::filesystem::path& model) {
                     "so a close result can be told apart from a lucky one. Adds a few minutes.",
                     false)) {
         action.report_out = "report.md";
+        action.compare_repeats = "3";
     }
     return action;
 }
@@ -374,7 +375,7 @@ MenuAction run_menu(const std::filesystem::path& profiles_directory) {
                 command += " --vram-headroom-mb " + action.vram_headroom_mb;
             }
             if (!action.report_out.empty()) {
-                command += " --report-out " + action.report_out;
+                command += " --compare-repeats " + action.compare_repeats + " --report-out " + action.report_out;
             }
             show_command(command);
             return action;

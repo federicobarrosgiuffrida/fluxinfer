@@ -23,6 +23,10 @@ struct MenuAction {
     std::string context = "4096";
     std::string vram_headroom_mb = "0";
     std::string report_out;
+    // Repetitions per side of the comparison report. Zero disables the
+    // report entirely, so this has to be set whenever report_out is: a
+    // filename on its own produces nothing.
+    std::string compare_repeats = "0";
 
     // Serve options passed through to llama-server after `--`.
     std::vector<std::string> extra_args;

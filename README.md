@@ -421,7 +421,7 @@ configurable with `--profiles-dir`), matching this schema:
   "model": { "path": "...", "size_bytes": 0, "fingerprint": "..." },
   "hardware": { "cpu": "...", "logical_threads": 0, "ram_bytes": 0, "gpu": "...", "vram_bytes": 0 },
   "llama": { "version": "...", "binary_path": "...", "supported_flags": [] },
-  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null, "context_length": 4096 },
+  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null, "context_length": 4096, "n_cpu_moe": null },
   "results": { "prompt_tps": 0.0, "generation_tps": 0.0, "duration_ms": 0, "score": 0.0 }
 }
 ```
@@ -430,6 +430,19 @@ A profile is considered invalid (and `run`/`serve` will refuse to use it,
 pointing you back to `tune`) if any of the following changed since it was
 created: the model file's size or fingerprint, the GPU, the VRAM capacity,
 the llama.cpp version, or the set of supported flags.
+
+**Writability is checked before tuning, not after.** A tuning run costs tens
+of minutes, so `tune` writes and removes a probe file in the profiles
+directory before the search starts, and refuses to begin if that fails. The
+usual cause on Windows is Controlled Folder Access -- Defender's ransomware
+protection -- which silently denies writes to Documents, Desktop and Pictures
+for executables it does not recognise, including a freshly built
+`fluxinfer.exe`. It reports the failure as "the system cannot find the file
+specified", which explains nothing, so the error message names the likely
+cause and how to check it (`(Get-MpPreference).EnableControlledFolderAccess`).
+Should a save still fail, the winning configuration is printed before the
+save is attempted, so the result of the run is on screen rather than lost
+with the error.
 
 **Model fingerprint**: file size + last-write-time + a hash of the first and
 last 1 MiB of the file, rather than a full-file hash. GGUF models are

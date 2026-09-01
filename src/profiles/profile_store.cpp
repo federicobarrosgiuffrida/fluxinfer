@@ -20,6 +20,25 @@ std::string sanitize_filename_component(const std::string& input) {
     return result.empty() ? "model" : result;
 }
 
+// A failed write into the profiles directory is nearly always one specific
+// thing on Windows, and the OS reports it as a plain "could not open file".
+// Naming the likely cause here saves the user a search -- and, in the case
+// this text was written for, an hour of re-tuning.
+std::string write_failure_hint(const std::filesystem::path& directory) {
+    std::string message = "cannot write to the profiles directory: " + directory.string();
+#if defined(_WIN32)
+    message +=
+        "\n  On Windows this is usually Controlled Folder Access (Windows Defender's ransomware protection),"
+        "\n  which blocks programs it does not recognise from writing to Documents, Desktop and Pictures."
+        "\n  Check with:  (Get-MpPreference).EnableControlledFolderAccess"
+        "\n  Fix by moving FluxInfer out of those folders (C:\\fluxinfer works), or by allowing fluxinfer.exe"
+        "\n  under Windows Security > Virus & threat protection > Ransomware protection.";
+#else
+    message += "\n  Check the directory's permissions and that the filesystem is not mounted read-only.";
+#endif
+    return message;
+}
+
 } // namespace
 
 ProfileStore::ProfileStore(std::filesystem::path profiles_directory) : profiles_directory_(std::move(profiles_directory)) {}
@@ -35,7 +54,7 @@ bool ProfileStore::save(const Profile& profile, std::string* error) const {
     std::error_code ec;
     std::filesystem::create_directories(profiles_directory_, ec);
     if (ec) {
-        if (error) *error = "could not create profiles directory: " + ec.message();
+        if (error) *error = write_failure_hint(profiles_directory_) + "\n  (" + ec.message() + ")";
         return false;
     }
 
@@ -45,7 +64,7 @@ bool ProfileStore::save(const Profile& profile, std::string* error) const {
     {
         std::ofstream file(tmp_path, std::ios::binary | std::ios::trunc);
         if (!file) {
-            if (error) *error = "could not open profile file for writing: " + tmp_path.string();
+            if (error) *error = write_failure_hint(profiles_directory_);
             return false;
         }
         file << to_json(profile).dump(2);
@@ -67,6 +86,39 @@ bool ProfileStore::save(const Profile& profile, std::string* error) const {
         }
     }
 
+    return true;
+}
+
+bool ProfileStore::check_writable(std::string* error) const {
+    std::error_code ec;
+    std::filesystem::create_directories(profiles_directory_, ec);
+    if (ec) {
+        // Same cause, same advice: a blocked mkdir under Documents reports
+        // "the system cannot find the file specified", which explains nothing.
+        if (error) *error = write_failure_hint(profiles_directory_) + "\n  (" + ec.message() + ")";
+        return false;
+    }
+
+    // An existing directory says nothing about being able to write into it:
+    // create_directories() succeeds as a no-op on a directory that Controlled
+    // Folder Access will refuse every write to. Only an actual write answers
+    // the question.
+    const std::filesystem::path probe = profiles_directory_ / ".fluxinfer-write-probe";
+    {
+        std::ofstream file(probe, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            if (error) *error = write_failure_hint(profiles_directory_);
+            return false;
+        }
+        file << "probe";
+        if (!file) {
+            if (error) *error = write_failure_hint(profiles_directory_);
+            std::filesystem::remove(probe, ec);
+            return false;
+        }
+    }
+
+    std::filesystem::remove(probe, ec);
     return true;
 }
 

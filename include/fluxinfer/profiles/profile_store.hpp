@@ -20,6 +20,15 @@ public:
 
     bool save(const Profile& profile, std::string* error = nullptr) const;
 
+    // Verifies that a profile could actually be written here, by creating
+    // the directory and writing (then removing) a probe file. Meant to be
+    // called *before* a tuning run: a tune costs tens of minutes, and
+    // discovering only at the end that the directory is not writable throws
+    // the whole result away. On Windows the usual cause is Controlled
+    // Folder Access, which silently denies writes to Documents/Desktop/
+    // Pictures for executables it does not recognise.
+    bool check_writable(std::string* error = nullptr) const;
+
     // Loads the profile for `current_model` (if any) and validates it
     // against the given current hardware/llama.cpp snapshot via
     // profile_is_valid_for(). Returns std::nullopt (with *reason set) if no

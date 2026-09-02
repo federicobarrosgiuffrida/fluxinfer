@@ -2,6 +2,10 @@
 
 #include "fluxinfer/tuner/parameter_space.hpp"
 
+#include <algorithm>
+#include <functional>
+#include <vector>
+
 using namespace fluxinfer::tuner;
 
 namespace {
@@ -135,4 +139,123 @@ TEST_CASE("thread_candidates covers physical, logical, and midpoint on SMT hardw
     CHECK(threads.count(8) == 1);
     CHECK(threads.count(16) == 1);
     CHECK(threads.count(12) == 1);
+}
+
+TEST_CASE("gpu_layers_candidates seeds a candidate from the VRAM that actually fits", "[param-space]") {
+    // 4GiB model over 32 layers = 128MiB/layer. With 8GiB of VRAM and the
+    // headroom below, ~7GiB is usable -> the whole model fits, so the seed
+    // lands on full offload and adds nothing beyond the existing endpoints.
+    SECTION("model that fits entirely adds no candidate beyond full offload") {
+        ParameterSpaceInput input = make_input(8, 16, 32 * kGiB, true, 8 * kGiB, 32);
+        input.vram_headroom_bytes = kGiB;
+        std::vector<TuneConfig> candidates = gpu_layers_candidates(input, baseline_config(input));
+
+        std::vector<int> layers;
+        for (const TuneConfig& candidate : candidates) {
+            layers.push_back(candidate.gpu_layers);
+        }
+        CHECK(layers == std::vector<int>{0, 8, 16, 24, 32});
+    }
+
+    SECTION("model larger than VRAM seeds a candidate at the real boundary") {
+        // 20GiB model over 40 layers = 512MiB/layer, on a 12GiB card with
+        // 1.5GiB headroom -> (12 - 1.5) / 0.5 = 21 layers expected.
+        ParameterSpaceInput input = make_input(8, 16, 32 * kGiB, true, 12 * kGiB, 40);
+        input.model_size_bytes = 20ULL * kGiB;
+        input.vram_headroom_bytes = kGiB + kGiB / 2;
+        std::vector<TuneConfig> candidates = gpu_layers_candidates(input, baseline_config(input));
+
+        std::vector<int> layers;
+        for (const TuneConfig& candidate : candidates) {
+            layers.push_back(candidate.gpu_layers);
+        }
+        // The fixed percentiles (0/10/20/30/40) never probe near 21; the
+        // seeded candidate is what puts the search next to the real limit.
+        CHECK(std::find(layers.begin(), layers.end(), 21) != layers.end());
+        CHECK(std::is_sorted(layers.begin(), layers.end()));
+    }
+
+    SECTION("headroom larger than available VRAM seeds nothing (and does not underflow)") {
+        ParameterSpaceInput input = make_input(8, 16, 32 * kGiB, true, kGiB, 32);
+        input.vram_headroom_bytes = 4 * kGiB;
+        std::vector<TuneConfig> candidates = gpu_layers_candidates(input, baseline_config(input));
+
+        std::vector<int> layers;
+        for (const TuneConfig& candidate : candidates) {
+            layers.push_back(candidate.gpu_layers);
+        }
+        CHECK(layers == std::vector<int>{0, 8, 16, 24, 32});
+    }
+}
+
+TEST_CASE("default_vram_headroom_bytes is a nonzero, sane amount", "[param-space]") {
+    const std::uint64_t headroom = default_vram_headroom_bytes();
+    CHECK(headroom >= kGiB);
+    CHECK(headroom <= 2 * kGiB);
+}
+
+namespace {
+ParameterSpaceInput make_moe_input(std::uint64_t layers, std::uint64_t experts, bool flag_supported) {
+    ParameterSpaceInput input = make_input(8, 16, 32 * kGiB, true, 12 * kGiB, layers);
+    input.expert_count = experts;
+    if (flag_supported) {
+        input.supported_flags.insert("--n-cpu-moe");
+    }
+    return input;
+}
+} // namespace
+
+TEST_CASE("is_moe_tunable requires a MoE model, a GPU and llama-bench support", "[param-space][moe]") {
+    CHECK(is_moe_tunable(make_moe_input(40, 256, true)));
+
+    SECTION("dense model") {
+        CHECK_FALSE(is_moe_tunable(make_moe_input(40, 1, true)));
+    }
+    SECTION("expert count unknown: treated as dense, never guessed") {
+        ParameterSpaceInput input = make_moe_input(40, 256, true);
+        input.expert_count.reset();
+        CHECK_FALSE(is_moe_tunable(input));
+    }
+    SECTION("llama-bench too old for the flag") {
+        CHECK_FALSE(is_moe_tunable(make_moe_input(40, 256, false)));
+    }
+    SECTION("no GPU") {
+        ParameterSpaceInput input = make_moe_input(40, 256, true);
+        input.hardware.gpu.available = false;
+        CHECK_FALSE(is_moe_tunable(input));
+    }
+    SECTION("layer count unavailable") {
+        ParameterSpaceInput input = make_moe_input(40, 256, true);
+        input.real_layer_count.reset();
+        CHECK_FALSE(is_moe_tunable(input));
+    }
+}
+
+TEST_CASE("n_cpu_moe_candidates descend from all-experts-on-CPU with full GPU offload", "[param-space][moe]") {
+    ParameterSpaceInput input = make_moe_input(40, 256, true);
+    std::vector<TuneConfig> candidates = n_cpu_moe_candidates(input, baseline_config(input));
+
+    REQUIRE_FALSE(candidates.empty());
+
+    std::vector<int> values;
+    for (const TuneConfig& candidate : candidates) {
+        REQUIRE(candidate.n_cpu_moe.has_value());
+        values.push_back(*candidate.n_cpu_moe);
+        // Every candidate offloads all layers: the experts are what moves.
+        CHECK(candidate.gpu_layers == 40);
+    }
+
+    // Safest (most experts in RAM) first, so the search walks towards the
+    // VRAM limit rather than starting past it.
+    CHECK(values.front() == 40);
+    CHECK(values.back() == 0);
+    CHECK(std::is_sorted(values.begin(), values.end(), std::greater<int>()));
+}
+
+TEST_CASE("n_cpu_moe_candidates is empty for models it must not touch", "[param-space][moe]") {
+    ParameterSpaceInput dense = make_moe_input(40, 1, true);
+    CHECK(n_cpu_moe_candidates(dense, baseline_config(dense)).empty());
+
+    ParameterSpaceInput unsupported = make_moe_input(40, 256, false);
+    CHECK(n_cpu_moe_candidates(unsupported, baseline_config(unsupported)).empty());
 }

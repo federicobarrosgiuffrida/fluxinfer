@@ -37,6 +37,13 @@ struct BestConfig {
     unsigned ubatch_size = 0;
     std::optional<std::string> kv_cache_type;
 
+    // MoE models: the tuned --n-cpu-moe value (how many layers keep their
+    // routed experts in system RAM). std::nullopt means the flag is not
+    // replayed at all -- either the model is dense or the profile predates
+    // this field. It is deliberately optional rather than 0-as-unset,
+    // because 0 is a meaningful tuned value ("put every expert on the GPU").
+    std::optional<int> n_cpu_moe;
+
     // The context size (`-c`/`--ctx-size`) this config was benchmarked
     // with (via llama-bench's `-d` pre-fill) and that `run`/`serve` will
     // launch llama-cli/llama-server with. 0 means "not recorded" (a

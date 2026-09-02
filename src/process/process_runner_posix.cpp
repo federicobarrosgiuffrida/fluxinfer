@@ -4,6 +4,8 @@
 
 #include "fluxinfer/process/process_runner.hpp"
 
+#include <algorithm>
+
 #include "line_buffer.hpp"
 
 #include <fcntl.h>
@@ -216,6 +218,8 @@ ProcessResult run_captured(const ProcessOptions& options) {
     std::string stdout_pending, stderr_pending;
     bool stdout_done = false, stderr_done = false;
     bool timed_out = false;
+    bool idle_timed_out = false;
+    auto last_activity = start_time;
 
     while (!stdout_done || !stderr_done) {
         std::array<pollfd, 2> pfds{};
@@ -230,16 +234,28 @@ ProcessResult run_captured(const ProcessOptions& options) {
             stderr_idx = nfds++;
         }
 
+        // Poll until whichever limit expires first; both are optional.
         int poll_timeout_ms = -1;
+        const auto now = std::chrono::steady_clock::now();
         if (options.timeout) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time);
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
             auto remaining = *options.timeout - elapsed;
             if (remaining.count() <= 0) {
                 timed_out = true;
                 break;
             }
             poll_timeout_ms = static_cast<int>(remaining.count());
+        }
+        if (options.idle_timeout) {
+            auto quiet_for = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_activity);
+            auto remaining_idle = *options.idle_timeout - quiet_for;
+            if (remaining_idle.count() <= 0) {
+                timed_out = true;
+                idle_timed_out = true;
+                break;
+            }
+            const int idle_ms = static_cast<int>(remaining_idle.count());
+            poll_timeout_ms = poll_timeout_ms < 0 ? idle_ms : std::min(poll_timeout_ms, idle_ms);
         }
 
         int ready = poll(pfds.data(), static_cast<nfds_t>(nfds), poll_timeout_ms);
@@ -248,9 +264,11 @@ ProcessResult run_captured(const ProcessOptions& options) {
             break;
         }
         if (ready == 0) {
-            timed_out = true;
-            break;
+            // Loop back to work out which limit expired (and whether the
+            // other one still has room), rather than assuming.
+            continue;
         }
+        last_activity = std::chrono::steady_clock::now();
 
         std::array<char, 4096> buffer{};
         if (stdout_idx >= 0 && (pfds[stdout_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
@@ -285,6 +303,7 @@ ProcessResult run_captured(const ProcessOptions& options) {
         int status = 0;
         waitpid(pid, &status, 0);
         result.outcome = ProcessOutcome::TimedOut;
+        result.idle_timed_out = idle_timed_out;
         result.exit_code = -1;
     } else {
         int status = 0;

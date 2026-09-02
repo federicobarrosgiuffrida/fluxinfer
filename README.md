@@ -12,12 +12,14 @@ FluxInfer does **not** reimplement llama.cpp, does not link against it, and
 does not modify it. It only locates and invokes prebuilt
 `llama-bench` / `llama-cli` / `llama-server` binaries as external processes.
 
-## Status: experimental (milestone 0.3.1)
+## Status: experimental (milestone 0.4.0)
 
 Hardware detection, real GGUF metadata discovery, a staged benchmark search
-driven by the model's actual layer count, profile persistence, a
-reproducible repeated-measurement comparison report, and the four core
-subcommands (`inspect`, `tune`, `run`, `serve`). It has not been used in
+driven by the model's actual layer count, a MoE-aware expert-placement
+search (`--n-cpu-moe`), measured peak-VRAM sampling with silent-spill
+rejection, profile persistence, a reproducible repeated-measurement
+comparison report, a pre-flight fit estimate, an interactive menu, and the
+six subcommands (`menu`, `inspect`, `doctor`, `tune`, `run`, `serve`). It has not been used in
 production. Interfaces (CLI flags, profile JSON schema) may still change.
 
 **Tested on:** one machine, two models, one GPU — Qwen3.5-9B (dense, Q8_0)
@@ -53,6 +55,24 @@ access or a package manager:
 Otherwise, only a C++20 compiler and CMake ≥ 3.20 are required. On Windows,
 GPU detection additionally links `pdh.lib` (part of the Windows SDK); on
 Linux it links `pthread` and `dl` for dynamic NVML loading.
+
+## Quick start (Windows)
+
+If you just want to run a model and would rather not build anything:
+
+```powershell
+irm https://raw.githubusercontent.com/federicobarrosgiuffrida/fluxinfer/master/scripts/install.ps1 | iex
+```
+
+[`scripts/install.ps1`](scripts/install.ps1) downloads a published
+FluxInfer release and a CUDA build of llama.cpp (plus the CUDA runtime
+DLLs those need), points `FLUXINFER_LLAMA_DIR` at them, adds `fluxinfer`
+to `PATH`, and opens the interactive menu. It compiles nothing and needs
+neither Visual Studio nor CMake.
+
+It does not install an NVIDIA driver or a model: it checks for both and
+tells you what is missing. Building from source is still the supported
+path for development, and is described below.
 
 ## Building
 
@@ -134,9 +154,12 @@ it.
 ## Usage
 
 ```bash
+fluxinfer menu     # interactive: pick a model and an action, no flags to remember
 fluxinfer inspect
-fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--llama-dir DIR] [--profiles-dir DIR]
-                                    [--context N] [--search-repetitions N]
+fluxinfer doctor
+fluxinfer tune  path/to/model.gguf [--timeout SECONDS] [--idle-timeout SECONDS] [--llama-dir DIR]
+                                    [--profiles-dir DIR] [--context N] [--search-repetitions N]
+                                    [--vram-headroom-mb N] [--no-moe-tune]
                                     [--compare-repeats N] [--warmup-runs N] [--report-out FILE]
 fluxinfer run   path/to/model.gguf [-- extra llama-cli args]
 fluxinfer serve path/to/model.gguf [--host HOST] [--port PORT] [-- extra llama-server args]
@@ -398,7 +421,7 @@ configurable with `--profiles-dir`), matching this schema:
   "model": { "path": "...", "size_bytes": 0, "fingerprint": "..." },
   "hardware": { "cpu": "...", "logical_threads": 0, "ram_bytes": 0, "gpu": "...", "vram_bytes": 0 },
   "llama": { "version": "...", "binary_path": "...", "supported_flags": [] },
-  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null, "context_length": 4096 },
+  "best_config": { "threads": 0, "gpu_layers": 0, "batch_size": 0, "ubatch_size": 0, "kv_cache_type": null, "context_length": 4096, "n_cpu_moe": null },
   "results": { "prompt_tps": 0.0, "generation_tps": 0.0, "duration_ms": 0, "score": 0.0 }
 }
 ```
@@ -407,6 +430,19 @@ A profile is considered invalid (and `run`/`serve` will refuse to use it,
 pointing you back to `tune`) if any of the following changed since it was
 created: the model file's size or fingerprint, the GPU, the VRAM capacity,
 the llama.cpp version, or the set of supported flags.
+
+**Writability is checked before tuning, not after.** A tuning run costs tens
+of minutes, so `tune` writes and removes a probe file in the profiles
+directory before the search starts, and refuses to begin if that fails. The
+usual cause on Windows is Controlled Folder Access -- Defender's ransomware
+protection -- which silently denies writes to Documents, Desktop and Pictures
+for executables it does not recognise, including a freshly built
+`fluxinfer.exe`. It reports the failure as "the system cannot find the file
+specified", which explains nothing, so the error message names the likely
+cause and how to check it (`(Get-MpPreference).EnableControlledFolderAccess`).
+Should a save still fail, the winning configuration is printed before the
+save is attempted, so the result of the run is on screen rather than lost
+with the error.
 
 **Model fingerprint**: file size + last-write-time + a hash of the first and
 last 1 MiB of the file, rather than a full-file hash. GGUF models are
@@ -431,6 +467,17 @@ model. See `compute_model_info()` in
   linear-attention/SSM-style "Gated Delta Net" block), llama.cpp forces at
   least one tensor onto CPU regardless of `-ngl` — so "N GPU layers" isn't
   always as uniform a knob as the search assumes.
+- The staged search optimises one axis at a time and the axes are not
+  independent: batch size and thread count both move VRAM usage, so an
+  offload value chosen before them can be invalidated by them. Since
+  0.4.0 a bounded second pass re-probes the offload value's immediate
+  neighbours under the final batch/thread settings, which narrows the
+  problem but does not make the search jointly optimal.
+- The fit estimate printed before tuning is arithmetic on weights, KV
+  cache and a flat overhead allowance -- not a model of llama.cpp's
+  allocator. It is meant to catch the obviously-impossible case, warns
+  rather than blocks, and says so when the model's metadata is too
+  incomplete to estimate at all.
 - No Bayesian optimization or other adaptive search — the staged search is
   fixed and coarse by design (see [Roadmap](#roadmap)). It does now run
   each candidate with `-r <search-repetitions>` (default 3) and score the
@@ -439,27 +486,40 @@ model. See `compute_model_info()` in
   both added after a real head-to-head against LM Studio (see
   [`docs/benchmarks/`](docs/benchmarks/)) showed single-sample decisions
   and a coarse boundary probe leaving real performance on the table.
-- No MoE-specific tuning yet: `expert_count`/`expert_used_count` are read
-  and surfaced (and `tune` prints a note when a model has active experts),
-  but the search itself doesn't yet treat MoE models any differently.
-  MoE-related llama.cpp flags (e.g. `--n-cpu-moe`) are only ever used if
-  auto-detected via `--help`, with no MoE-aware logic beyond that.
+- MoE tuning searches `--n-cpu-moe` at *whole-layer* granularity, which is
+  all llama.cpp exposes: GGUF stores a layer's routed experts as one fused
+  tensor, so individual experts cannot be placed separately from outside
+  the engine (see
+  [`docs/moe-vram-cache-research.md`](docs/moe-vram-cache-research.md)).
+  The search also picks layers by index, not by measured routing
+  popularity — informed placement is `0.5`, and requires per-layer
+  activation profiling that does not exist here yet. On MoE models the
+  dense `--n-gpu-layers` sweep is replaced rather than complemented
+  (`--no-moe-tune` forces the old behaviour), because that sweep is
+  non-monotonic on such models and its results are misleading.
 - The peak-VRAM sampler (`VramSampler`) polls NVML on a fixed interval from
   a background thread; it can miss short spikes between polls and reports
   GPU-wide usage (other processes included), not llama-bench's allocations
   specifically.
-- On Windows, an over-VRAM allocation is frequently reported by the WDDM
-  driver as a hang/timeout rather than a clean CUDA OOM error (observed in
-  practice, not just theorized). FluxInfer's OOM-boundary search treats a
-  timeout as *inconclusive* rather than a confirmed OOM (it won't select
-  it, but also won't necessarily stop climbing on it the way a confirmed
-  OOM does) specifically to avoid an unrelated slow run (e.g. a CPU-only
-  baseline exceeding its time budget) from being misread as a VRAM
-  ceiling. One consequence: a slow CPU-only config combined with
-  `--search-repetitions > 1` can hit the per-run timeout during the
-  search stage even though the same config succeeds fine given more time
-  (observed with the default `--timeout 60` and `--search-repetitions 3`
-  on a slow CPU baseline) — raise `--timeout` if you see this.
+- On Windows, an over-VRAM allocation does not fail cleanly. WDDM either
+  stalls the process (reported as a hang/timeout rather than a CUDA OOM)
+  or, worse, silently backs the allocation with system RAM so the run
+  *succeeds* at a fraction of the speed. FluxInfer handles both, but
+  neither perfectly:
+  - Timeouts are still treated as *inconclusive* rather than a confirmed
+    OOM (it won't select such a config, but won't necessarily stop
+    climbing on it either), so an unrelated slow run isn't misread as a
+    VRAM ceiling. Since `0.4.0` a run is only killed for being *silent*
+    (`--idle-timeout`), and the total budget scales with model size, so
+    healthy runs on large models are no longer cut short.
+  - Silent spills are caught by comparing measured peak VRAM and
+    throughput against the last good configuration
+    (`looks_like_vram_spill`). This is a heuristic with a deliberately
+    conservative threshold: a spill that costs less than ~40% of
+    throughput will not be flagged, and the guard depends on NVML samples
+    being available at all.
+  - `--vram-headroom-mb` (default 1.5GB on Windows, 1GB elsewhere) keeps
+    the search away from that regime in the first place.
 - `fluxinfer run`/`serve` re-detect supported flags from `llama-cli` /
   `llama-server`'s own `--help` output (which may differ from
   `llama-bench`'s), but profile *validity* is checked against
@@ -479,13 +539,15 @@ model. See `compute_model_info()` in
 0.1   hardware detection + launcher
 0.2   benchmark parser + profiles
 0.3   automatic tuning
-0.3.1 real GGUF metadata discovery + reproducible benchmark comparison   <- current
-0.4   static MoE expert-layer placement search (--n-cpu-moe as a tuned dimension)
+0.3.1 real GGUF metadata discovery + reproducible benchmark comparison
+0.4.0 static MoE expert-layer placement search (--n-cpu-moe as a tuned      <- current
+      dimension), measured VRAM + silent-spill rejection, idle-based
+      timeouts, `doctor`
 0.5   informed layer placement from offline expert-activation profiling (Linux/eBPF, opt-in)
 0.6   orchestration for a dynamic GPU expert cache, if/when one exists upstream
 ```
 
-Everything through `0.3.1` exists in an initial form; `0.4` onward is not
+Everything through `0.4.0` exists in an initial form; `0.5` onward is not
 implemented. `0.4`–`0.6` were reordered and re-scoped from the original
 plan after dedicated research — see
 [`docs/moe-vram-cache-research.md`](docs/moe-vram-cache-research.md) for

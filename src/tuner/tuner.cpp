@@ -1,10 +1,13 @@
 #include "fluxinfer/tuner/tuner.hpp"
 
+#include "fluxinfer/hardware/vram_sampler.hpp"
+
 #include "fluxinfer/llama/benchmark_parser.hpp"
 #include "fluxinfer/llama/llama_runner.hpp"
 #include "fluxinfer/tuner/parameter_space.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <system_error>
 
 namespace fluxinfer::tuner {
@@ -58,6 +61,10 @@ std::vector<std::string> Tuner::build_arguments(const TuneConfig& config, unsign
         args.push_back("--no-warmup");
     }
 
+    if (config.n_cpu_moe) {
+        add_if_supported(args, options_.supported_flags, "--n-cpu-moe", "-ncmoe", std::to_string(*config.n_cpu_moe));
+    }
+
     if (config.kv_cache_type) {
         if (llama::supports_flag(options_.supported_flags, "--cache-type-k")) {
             args.push_back("-ctk");
@@ -76,12 +83,42 @@ std::vector<std::string> Tuner::build_arguments(const TuneConfig& config, unsign
         }
     }
 
+    // Ask llama-bench to announce each phase. Without this it is silent
+    // until the very end in JSON mode, which makes an idle timeout
+    // meaningless (it would only measure total runtime, badly).
+    if (llama::supports_flag(options_.supported_flags, "--progress")) {
+        args.push_back("--progress");
+    }
+
     if (llama::supports_flag(options_.supported_flags, "--output")) {
         args.push_back("-o");
         args.push_back("json");
     }
 
     return args;
+}
+
+std::chrono::milliseconds Tuner::effective_idle_timeout() const {
+    // Silence only means "stuck" if llama-bench would otherwise be talking.
+    if (!llama::supports_flag(options_.supported_flags, "--progress")) {
+        return std::chrono::milliseconds::zero();
+    }
+    if (options_.idle_timeout <= std::chrono::milliseconds::zero()) {
+        return std::chrono::milliseconds::zero();
+    }
+
+    // The longest legitimately silent phase is the depth prefill: it
+    // processes `context_length` tokens in one go, with no output until it
+    // finishes. Budget it at a deliberately pessimistic floor for
+    // prompt-processing throughput -- well below anything measured on real
+    // hardware (the worst observed on an RTX 3060 was ~77 tok/s, and that
+    // was already a machine in trouble) -- so a healthy prefill is never
+    // mistaken for a hang, while a truly stuck process is still caught in
+    // bounded time.
+    constexpr double kPessimisticPromptTokensPerSecond = 25.0;
+    const auto prefill_budget = std::chrono::milliseconds(
+        static_cast<std::int64_t>(1000.0 * options_.context_length / kPessimisticPromptTokensPerSecond));
+    return std::max(options_.idle_timeout, prefill_budget);
 }
 
 BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, bool disable_warmup) {
@@ -93,12 +130,39 @@ BenchmarkResult Tuner::run_one(const TuneConfig& config, unsigned repetitions, b
     // dominant per-run cost (loading a possibly multi-GB model) is paid
     // once; scaling the timeout by repetitions is a generous but safe
     // ceiling rather than a tight estimate.
-    const auto effective_timeout = options_.per_run_timeout * std::max(1u, repetitions);
-    llama::LlamaRunResult run = llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout);
+    auto effective_timeout = options_.per_run_timeout * std::max(1u, repetitions);
+    // Scale the cap with model size: a 21GB model takes minutes just to be
+    // read off disk, so a fixed budget tuned for a small model reports
+    // "timed out" for runs that were never in trouble. The idle timeout
+    // below is what actually catches hangs, so the cap only needs to be
+    // generous enough not to fire spuriously.
+    constexpr std::int64_t kTimeoutMillisPerGiB = 10000;
+    constexpr std::uint64_t kGiB = 1024ULL * 1024 * 1024;
+    const auto size_based = std::chrono::milliseconds(
+        static_cast<std::int64_t>(model_size_bytes_ / kGiB) * kTimeoutMillisPerGiB * std::max(1u, repetitions));
+    // The same prefill the idle window accounts for also has to fit inside
+    // the total budget, or the cap simply replaces the idle timeout as the
+    // thing that kills healthy runs.
+    constexpr double kPessimisticPromptTokensPerSecond = 25.0;
+    const auto prefill_budget = std::chrono::milliseconds(
+        static_cast<std::int64_t>(1000.0 * options_.context_length / kPessimisticPromptTokensPerSecond));
+    effective_timeout = std::max(effective_timeout, size_based + prefill_budget);
+
+    // Measure what the card is actually doing during the run. The sampler
+    // is GPU-wide and coarse (see VramSampler), which is the right scope
+    // here: the question is whether the *card* ran out of room, including
+    // whatever else the machine had resident at the time.
+    hardware::VramSampler sampler;
+    sampler.start();
+    llama::LlamaRunResult run =
+        llama::run_llama_binary(options_.llama_bench_path, args, effective_timeout, effective_idle_timeout());
+    sampler.stop();
+    result.measured_peak_vram_bytes = sampler.peak_used_bytes();
 
     result.ran = run.outcome != process::ProcessOutcome::FailedToStart;
     result.exit_code = run.exit_code;
     result.timed_out = run.timed_out;
+    result.idle_timed_out = run.idle_timed_out;
     result.crashed = run.crashed;
     result.oom = run.likely_oom;
     result.duration = run.duration;
@@ -207,9 +271,19 @@ TuningOutcome Tuner::run() {
     psi.supported_flags = options_.supported_flags;
     psi.model_size_bytes = model_size_bytes_;
     psi.real_layer_count = options_.real_layer_count;
+    psi.vram_headroom_bytes = options_.vram_headroom_bytes;
+    psi.expert_count = options_.moe_tuning_enabled ? options_.expert_count : std::nullopt;
 
+    const std::uint64_t headroom =
+        options_.vram_headroom_bytes > 0 ? options_.vram_headroom_bytes : default_vram_headroom_bytes();
+
+    // A MoE model uses the expert-placement search *instead of* the dense
+    // gpu-layers sweep: on such models the latter is not merely suboptimal
+    // but misleading (non-monotonic), so running both would waste probes
+    // and could hand the wrong configuration to the later stages.
+    const bool moe_stage_enabled = is_moe_tunable(psi);
     const bool gpu_layers_stage_enabled =
-        options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;
+        !moe_stage_enabled && options_.hardware.gpu.available && options_.real_layer_count && *options_.real_layer_count > 0;
 
     // Stage 1: baseline.
     const TuneConfig baseline = baseline_config(psi);
@@ -229,11 +303,26 @@ TuningOutcome Tuner::run() {
 
         int last_good_layers = -1;
         int oom_layers = -1;
+        std::optional<BenchmarkResult> last_good_result;
         for (const auto& candidate : candidates) {
             if (oom_layers >= 0 && candidate.gpu_layers >= oom_layers) {
                 continue;
             }
             BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            // A successful-looking run that filled the card and collapsed
+            // relative to the last good one is a silent WDDM spill, not a
+            // usable candidate: treat it exactly like an OOM boundary, so
+            // nothing above it is attempted and it cannot win on score.
+            if (last_good_result &&
+                looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                outcome.all_results.push_back(result);
+                oom_layers = candidate.gpu_layers;
+                continue;
+            }
             outcome.all_results.push_back(result);
             if (result.oom) {
                 oom_layers = candidate.gpu_layers;
@@ -253,6 +342,7 @@ TuningOutcome Tuner::run() {
             // capacity -- the next, larger candidate is still attempted.
             if (result.usable()) {
                 last_good_layers = candidate.gpu_layers;
+                last_good_result = result;
                 if (result.score > best.score) {
                     best = result;
                 }
@@ -268,12 +358,23 @@ TuningOutcome Tuner::run() {
             midpoint.gpu_layers = midpoint_layers;
             midpoint.label = "gpu_layers=" + std::to_string(midpoint_layers) + " (binary search)";
             BenchmarkResult mid_result = run_one(midpoint, options_.search_repetitions, false);
-            outcome.all_results.push_back(mid_result);
             ++probes;
+            if (last_good_result &&
+                looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
+                outcome.all_results.push_back(mid_result);
+                oom_layers = midpoint_layers;
+                continue;
+            }
+            outcome.all_results.push_back(mid_result);
             if (mid_result.oom) {
                 oom_layers = midpoint_layers;
             } else if (mid_result.usable()) {
                 last_good_layers = midpoint_layers;
+                last_good_result = mid_result;
                 if (mid_result.score > best.score) {
                     best = mid_result;
                 }
@@ -288,9 +389,147 @@ TuningOutcome Tuner::run() {
         }
     }
 
+    // Stage 2 (MoE variant): expert placement. Walks --n-cpu-moe down from
+    // "every layer's experts in system RAM" towards "none", i.e. from the
+    // lowest VRAM demand to the highest, so the search approaches its limit
+    // from the safe side. The first value that OOMs or shows a silent spill
+    // becomes the floor, and a bounded bisection then closes the gap
+    // between it and the last good value.
+    if (moe_stage_enabled) {
+        std::vector<TuneConfig> candidates = n_cpu_moe_candidates(psi, baseline);
+
+        int last_good_ncmoe = -1;
+        int failed_ncmoe = -1;         // lowest value known to fail outright (OOM/spill)
+        int lowest_failed_ncmoe = -1;  // lowest value that failed inconclusively (timeout/crash)
+        std::optional<BenchmarkResult> last_good_result;
+        for (const auto& candidate : candidates) {
+            const int ncmoe = candidate.n_cpu_moe.value_or(0);
+            if (failed_ncmoe >= 0 && ncmoe <= failed_ncmoe) {
+                continue;
+            }
+            BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            if (last_good_result &&
+                looks_like_vram_spill(result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                outcome.all_results.push_back(result);
+                failed_ncmoe = ncmoe;
+                continue;
+            }
+            outcome.all_results.push_back(result);
+            if (result.oom) {
+                failed_ncmoe = ncmoe;
+                continue;
+            }
+            if (result.usable() && best.usable() &&
+                exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                // Fast, but with no VRAM to spare: it fits this machine in
+                // this moment, not the machine the profile will be used on.
+                // Treated as the boundary, so the search keeps the last
+                // configuration that still had margin.
+                result.vram_headroom_exceeded = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                failed_ncmoe = ncmoe;
+                continue;
+            }
+            if (result.usable()) {
+                last_good_ncmoe = ncmoe;
+                last_good_result = result;
+                if (result.score > best.score) {
+                    best = result;
+                }
+            } else {
+                // Timed out or crashed: not proof of an OOM, so it does not
+                // stop the sweep the way a confirmed OOM does -- but it is
+                // still the lowest value known *not* to work, which is
+                // exactly what the bisection below needs as a floor.
+                // Without this, a Windows machine (where an over-VRAM MoE
+                // configuration stalls instead of reporting OOM) never
+                // refines at all: observed on an RTX 3060, where the sweep
+                // stopped at the coarse grid and left the real optimum
+                // between two probes unexplored.
+                if (lowest_failed_ncmoe < 0 || ncmoe < lowest_failed_ncmoe) {
+                    lowest_failed_ncmoe = ncmoe;
+                }
+            }
+        }
+
+        // Refine against whichever floor is known: a confirmed OOM/spill if
+        // there is one, otherwise the lowest inconclusive failure.
+        if (failed_ncmoe < 0) {
+            failed_ncmoe = lowest_failed_ncmoe;
+        }
+
+        // Same bounded refinement as the dense search, mirrored: here the
+        // usable side is the *higher* value and the failing side the lower.
+        constexpr int kMaxRefinementProbes = 4;
+        int probes = 0;
+        while (failed_ncmoe >= 0 && last_good_ncmoe >= 0 && last_good_ncmoe - failed_ncmoe > 1 &&
+               probes < kMaxRefinementProbes) {
+            const int midpoint_ncmoe = failed_ncmoe + (last_good_ncmoe - failed_ncmoe) / 2;
+            TuneConfig midpoint = baseline;
+            midpoint.gpu_layers = static_cast<int>(options_.real_layer_count.value_or(0));
+            midpoint.n_cpu_moe = midpoint_ncmoe;
+            midpoint.label = "n_cpu_moe=" + std::to_string(midpoint_ncmoe) + " (binary search)";
+            BenchmarkResult mid_result = run_one(midpoint, options_.search_repetitions, false);
+            ++probes;
+            if (last_good_result &&
+                looks_like_vram_spill(mid_result, *last_good_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_spill_suspected = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
+                outcome.all_results.push_back(mid_result);
+                failed_ncmoe = midpoint_ncmoe;
+                continue;
+            }
+            outcome.all_results.push_back(mid_result);
+            if (mid_result.usable() && best.usable() &&
+                exceeds_vram_headroom(mid_result, options_.hardware.gpu.total_vram_bytes, headroom)) {
+                mid_result.vram_headroom_exceeded = true;
+                if (options_.on_rejected) {
+                    options_.on_rejected(mid_result);
+                }
+                failed_ncmoe = midpoint_ncmoe;
+                continue;
+            }
+            if (mid_result.usable()) {
+                last_good_ncmoe = midpoint_ncmoe;
+                last_good_result = mid_result;
+                if (mid_result.score > best.score) {
+                    best = mid_result;
+                }
+            } else {
+                // OOM, or inconclusive (timeout/crash): either way this
+                // value is not demonstrably usable, so it becomes the new
+                // floor rather than being promoted -- same reasoning as the
+                // dense search.
+                failed_ncmoe = midpoint_ncmoe;
+            }
+        }
+    }
+
     // Stage 3: batch/ubatch, based on the best configuration found so far.
+    // Batch size is not VRAM-neutral: larger batches allocate larger compute
+    // buffers, which on a card already close to full is enough to push the
+    // configuration into the same silent spill the offload stages guard
+    // against. Observed at -c 32768 on an RTX 3060, where batch=2048 halved
+    // generation throughput against the very same expert placement. So the
+    // guard applies here too, against the best configuration so far.
     for (const auto& candidate : batch_ubatch_candidates(psi, best.config)) {
         BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+        if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
+            result.vram_spill_suspected = true;
+            if (options_.on_rejected) {
+                options_.on_rejected(result);
+            }
+            outcome.all_results.push_back(result);
+            continue;
+        }
         outcome.all_results.push_back(result);
         if (result.score > best.score) {
             best = result;
@@ -303,6 +542,16 @@ TuningOutcome Tuner::run() {
             continue; // already measured in an earlier stage
         }
         BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+        // Thread count is not VRAM-neutral on a MoE model either: the
+        // CPU-resident experts' working buffers scale with it.
+        if (looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom)) {
+            result.vram_spill_suspected = true;
+            if (options_.on_rejected) {
+                options_.on_rejected(result);
+            }
+            outcome.all_results.push_back(result);
+            continue;
+        }
         outcome.all_results.push_back(result);
         if (result.score > best.score) {
             best = result;
@@ -310,6 +559,64 @@ TuningOutcome Tuner::run() {
     }
 
     outcome.best = best;
+    // Stage 5: revisit the offload axis under the batch and thread settings
+    // the later stages chose.
+    //
+    // The search optimises one axis at a time, but the axes are not
+    // independent: batch size and thread count both move VRAM usage, so the
+    // expert placement (or GPU layer count) picked in stage 2 was chosen
+    // under conditions that no longer hold. Measured on an RTX 3060, a
+    // batch chosen after the offload was enough to push a configuration
+    // into a spill it had been clear of.
+    //
+    // A full second search would double the runtime, so this is a bounded
+    // re-probe: the immediate neighbours of the current value, under the
+    // final settings, keeping whichever wins. It cannot make the result
+    // worse -- a neighbour is only adopted if it scores higher -- and it
+    // costs two runs.
+    if (best.usable() && (moe_stage_enabled || gpu_layers_stage_enabled)) {
+        const bool moe_axis = best.config.n_cpu_moe.has_value();
+        const int current = moe_axis ? *best.config.n_cpu_moe : best.config.gpu_layers;
+        const auto total_layers = static_cast<int>(options_.real_layer_count.value_or(0));
+
+        std::vector<int> neighbours;
+        if (current - 1 >= 0) {
+            neighbours.push_back(current - 1);
+        }
+        if (current + 1 <= total_layers) {
+            neighbours.push_back(current + 1);
+        }
+
+        for (int value : neighbours) {
+            TuneConfig candidate = best.config;
+            if (moe_axis) {
+                candidate.n_cpu_moe = value;
+                candidate.label = "n_cpu_moe=" + std::to_string(value) + " (recheck at final batch/threads)";
+            } else {
+                candidate.gpu_layers = value;
+                candidate.label = "gpu_layers=" + std::to_string(value) + " (recheck at final batch/threads)";
+            }
+
+            BenchmarkResult result = run_one(candidate, options_.search_repetitions, false);
+            const bool rejected =
+                looks_like_vram_spill(result, best, options_.hardware.gpu.total_vram_bytes, headroom) ||
+                (result.usable() && exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom));
+            if (rejected) {
+                result.vram_spill_suspected = !exceeds_vram_headroom(result, options_.hardware.gpu.total_vram_bytes, headroom);
+                result.vram_headroom_exceeded = !result.vram_spill_suspected;
+                if (options_.on_rejected) {
+                    options_.on_rejected(result);
+                }
+                outcome.all_results.push_back(result);
+                continue;
+            }
+            outcome.all_results.push_back(result);
+            if (result.usable() && result.score > best.score) {
+                best = result;
+            }
+        }
+    }
+
     if (!best.usable()) {
         outcome.success = false;
         outcome.error = "every benchmark configuration failed (OOM, crash, timeout or invalid output)";

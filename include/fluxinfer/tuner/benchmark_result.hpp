@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,10 @@ struct BenchmarkResult {
     bool ran = false; // process was launched and returned (not FailedToStart)
     int exit_code = -1;
     bool timed_out = false;
+    // Only meaningful with timed_out: true when the process was killed for
+    // going silent (a stall), false when it was still producing output and
+    // merely exceeded its total budget. See LlamaRunResult::idle_timed_out.
+    bool idle_timed_out = false;
     bool crashed = false;
     bool oom = false;
     bool output_valid = false; // benchmark_parser could extract tok/s figures
@@ -33,6 +38,28 @@ struct BenchmarkResult {
 
     std::uint64_t estimated_ram_bytes = 0;
     std::uint64_t estimated_vram_bytes = 0;
+
+    // Peak GPU-wide VRAM usage observed by polling NVML while this run was
+    // in flight (see hardware::VramSampler). std::nullopt when no GPU
+    // sample could be taken. Unlike estimated_vram_bytes this is measured,
+    // but it is still GPU-wide: it includes whatever other processes were
+    // holding at the time, which is exactly what matters for deciding
+    // whether the card was full.
+    std::optional<std::uint64_t> measured_peak_vram_bytes;
+
+    // Set when a run completed "successfully" but shows the signature of a
+    // silent over-VRAM spill: the card was effectively full and throughput
+    // collapsed relative to a less GPU-heavy configuration. On Windows,
+    // WDDM backs such allocations with system RAM instead of failing, so
+    // there is no OOM to detect -- the run looks fine and is simply slow.
+    // Treated as a boundary by the search, like an OOM, rather than as a
+    // usable candidate.
+    bool vram_spill_suspected = false;
+
+    // Set when a run measured fine but left less VRAM free than the
+    // configured headroom: it fits the benchmark machine, not the working
+    // one. Not promoted to best while a configuration with margin exists.
+    bool vram_headroom_exceeded = false;
 
     std::chrono::milliseconds duration{0};
     double score = 0.0;

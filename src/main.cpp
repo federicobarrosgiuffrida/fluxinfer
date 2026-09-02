@@ -1,6 +1,7 @@
 #include <CLI11/CLI11.hpp>
 
 #include "fluxinfer/hardware/hardware_info.hpp"
+#include "fluxinfer/menu.hpp"
 #include "fluxinfer/llama/gguf_metadata.hpp"
 #include "fluxinfer/llama/llama_locator.hpp"
 #include "fluxinfer/llama/llama_runner.hpp"
@@ -8,6 +9,8 @@
 #include "fluxinfer/profiles/profile.hpp"
 #include "fluxinfer/profiles/profile_store.hpp"
 #include "fluxinfer/tuner/comparison.hpp"
+#include "fluxinfer/tuner/feasibility.hpp"
+#include "fluxinfer/tuner/parameter_space.hpp"
 #include "fluxinfer/tuner/tuner.hpp"
 
 #include <csignal>
@@ -107,6 +110,19 @@ void install_termination_forwarding(process::InteractiveProcess* proc) {
 #endif
 }
 
+void print_gpu(const hardware::GpuInfo& gpu, const char* indent) {
+    std::cout << indent << "Name: " << gpu.name << " (device " << gpu.index << ")\n";
+    std::cout << indent << "Total VRAM: " << format_gib(gpu.total_vram_bytes) << "\n";
+    std::cout << indent << "Available VRAM: " << format_gib(gpu.available_vram_bytes) << "\n";
+    std::cout << indent << "Compute capability: ";
+    if (gpu.has_compute_capability()) {
+        std::cout << gpu.compute_capability_major << "." << gpu.compute_capability_minor << "\n";
+    } else {
+        std::cout << "unknown (driver did not report it)\n";
+    }
+    std::cout << indent << "Backend: " << gpu.backend << "\n";
+}
+
 // ---------------------------------------------------------------------
 // fluxinfer inspect
 // ---------------------------------------------------------------------
@@ -124,10 +140,14 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 
     std::cout << "GPU:\n";
     if (hw.gpu.available) {
-        std::cout << "  Name: " << hw.gpu.name << "\n";
-        std::cout << "  Total VRAM: " << format_gib(hw.gpu.total_vram_bytes) << "\n";
-        std::cout << "  Available VRAM: " << format_gib(hw.gpu.available_vram_bytes) << "\n";
-        std::cout << "  Backend: " << hw.gpu.backend << "\n\n";
+        print_gpu(hw.gpu, "  ");
+        // Additional devices are reported but never tuned against: FluxInfer
+        // benchmarks and serves on the primary device only.
+        for (std::size_t i = 1; i < hw.gpus.size(); ++i) {
+            std::cout << "  --- additional device (not used for tuning) ---\n";
+            print_gpu(hw.gpus[i], "  ");
+        }
+        std::cout << "\n";
     } else {
         std::cout << "  Not available (" << hw.gpu.unavailable_reason << ")\n\n";
     }
@@ -151,12 +171,126 @@ int cmd_inspect(const std::string& llama_dir_opt) {
 }
 
 // ---------------------------------------------------------------------
+// fluxinfer doctor
+// ---------------------------------------------------------------------
+// Answers, in one place, the questions that come up when something does
+// not work: which binaries am I actually using, does that build support
+// the flags FluxInfer wants to tune, and does it see the GPU at all. All
+// of this was already available piecemeal (inspect, --help probing, a
+// failed run's error text); the value here is having it in one output that
+// can be pasted into a bug report.
+int cmd_doctor(const std::string& llama_dir_opt) {
+    const hardware::HardwareInfo hw = hardware::probe_hardware();
+
+    std::cout << "Hardware:\n";
+    std::cout << "  CPU: " << hw.cpu.name << " (" << hw.cpu.physical_cores << " physical / " << hw.cpu.logical_threads
+              << " logical)\n";
+    std::cout << "  RAM: " << format_gib(hw.memory.available_bytes) << " available of " << format_gib(hw.memory.total_bytes)
+              << "\n";
+    if (hw.gpu.available) {
+        print_gpu(hw.gpu, "  ");
+        for (std::size_t i = 1; i < hw.gpus.size(); ++i) {
+            std::cout << "  --- additional device (not used for tuning) ---\n";
+            print_gpu(hw.gpus[i], "  ");
+        }
+    } else {
+        std::cout << "  GPU: not available (" << hw.gpu.unavailable_reason << ")\n";
+    }
+    std::cout << "\n";
+
+    llama::LlamaLocator locator(resolve_llama_dir(llama_dir_opt));
+    llama::LlamaBinaries binaries = locator.locate();
+
+    std::cout << "llama.cpp binaries:\n";
+    auto print_binary = [](const char* name, const std::optional<std::filesystem::path>& path) {
+        if (path) {
+            std::cout << "  " << name << ": " << path->string() << "\n";
+        } else {
+            std::cout << "  " << name << ": NOT FOUND\n";
+        }
+    };
+    print_binary("llama-bench", binaries.llama_bench);
+    print_binary("llama-cli", binaries.llama_cli);
+    print_binary("llama-server", binaries.llama_server);
+
+    if (!binaries.llama_bench) {
+        std::cout << "\nllama-bench is required for `tune`. Point FluxInfer at a llama.cpp build with --llama-dir, the\n"
+                     "FLUXINFER_LLAMA_DIR environment variable, or by putting the binaries on PATH.\n";
+        return 1;
+    }
+
+    std::cout << "  version: " << llama::detect_llama_version(*binaries.llama_bench) << "\n\n";
+
+    // Flags FluxInfer tunes or replays. A missing one is not an error: the
+    // corresponding stage is skipped. Saying so explicitly beats leaving
+    // the operator to wonder why a search dimension never appeared.
+    const std::set<std::string> flags = llama::detect_supported_flags(*binaries.llama_bench);
+    struct FlagCheck {
+        const char* flag;
+        const char* purpose;
+    };
+    const std::vector<FlagCheck> checks = {
+        {"--n-gpu-layers", "offload search (dense models)"},
+        {"--n-cpu-moe", "expert placement search (MoE models)"},
+        {"--n-depth", "benchmarking at the context size run/serve will use"},
+        {"--cache-type-k", "KV cache quantization"},
+        {"--cache-type-v", "KV cache quantization"},
+        {"--no-warmup", "warmup control in the comparison report"},
+    };
+    std::cout << "llama-bench capabilities:\n";
+    for (const FlagCheck& check : checks) {
+        const bool supported = llama::supports_flag(flags, check.flag);
+        std::cout << "  " << (supported ? "[yes] " : "[no ] ") << check.flag << " -- " << check.purpose << "\n";
+    }
+
+    std::cout << "\nGPU visibility of this build:\n";
+    if (!hw.gpu.available) {
+        std::cout << "  skipped: no NVIDIA GPU detected on this machine.\n";
+    } else {
+        // A CUDA-enabled llama.cpp lists its devices in --help output; a
+        // CPU-only build does not. This is a heuristic reading of text
+        // llama.cpp is free to change, so an inconclusive answer is
+        // reported as such rather than as a failure.
+        llama::LlamaRunResult help =
+            llama::run_llama_binary(*binaries.llama_bench, {"--help"}, std::chrono::seconds(20));
+        const std::string output = help.stdout_data + help.stderr_data;
+        const bool mentions_devices = output.find("CUDA") != std::string::npos ||
+                                       output.find("available devices") != std::string::npos ||
+                                       output.find("Device ") != std::string::npos;
+        if (mentions_devices) {
+            std::cout << "  llama-bench reports CUDA device support.\n";
+        } else {
+            std::cout << "  inconclusive: llama-bench's help output does not mention CUDA devices. If tuning only ever\n"
+                         "  produces CPU-speed results, this build is probably CPU-only and needs to be rebuilt with\n"
+                         "  CUDA enabled (FluxInfer does not build llama.cpp itself).\n";
+        }
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // fluxinfer tune <model.gguf>
 // ---------------------------------------------------------------------
 int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt, const std::string& profiles_dir_opt,
              unsigned timeout_seconds, unsigned search_repetitions, unsigned context_length, unsigned compare_repeats,
+             unsigned vram_headroom_mb, unsigned idle_timeout_seconds, bool no_moe_tune,
              unsigned warmup_runs, const std::string& report_out_opt) {
     const std::filesystem::path model_path(model_path_str);
+
+    // Before anything expensive: make sure the result will have somewhere to
+    // go. Tuning a large model costs tens of minutes, and a profile that
+    // cannot be written at the end takes all of it with it.
+    {
+        const profiles::ProfileStore store(profiles_dir_opt);
+        std::string writable_error;
+        if (!store.check_writable(&writable_error)) {
+            std::cerr << "error: " << writable_error << "\n"
+                      << "\nRefusing to start: the tuning result could not be saved when it finished.\n"
+                      << "Use --profiles-dir to write the profile somewhere else.\n";
+            return 1;
+        }
+    }
 
     std::string model_error;
     std::optional<profiles::ModelInfo> model_info = profiles::compute_model_info(model_path, &model_error);
@@ -194,7 +328,7 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
         }
         if (gguf.metadata.expert_count && *gguf.metadata.expert_count > 0) {
             std::cout << " experts=" << *gguf.metadata.expert_count << "/" << gguf.metadata.expert_used_count.value_or(0)
-                       << " active (MoE model: this MVP does not do MoE-aware tuning yet)";
+                       << " active (MoE model)";
         }
         std::cout << "\n";
     } else {
@@ -207,12 +341,42 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     options.hardware = hw;
     options.supported_flags = supported_flags;
     options.real_layer_count = gguf.valid ? gguf.metadata.block_count : std::nullopt;
+    options.expert_count = gguf.valid ? gguf.metadata.expert_count : std::nullopt;
+    options.moe_tuning_enabled = !no_moe_tune;
     options.per_run_timeout = std::chrono::seconds(timeout_seconds);
+    options.vram_headroom_bytes = static_cast<std::uint64_t>(vram_headroom_mb) * 1024ULL * 1024ULL;
+
+    // Say up front whether this combination can work at all. A tuning run
+    // costs tens of minutes on a large model; discovering at the end that
+    // nothing could ever have fitted is a poor way to spend them.
+    {
+        const std::uint64_t headroom_for_estimate =
+            options.vram_headroom_bytes > 0 ? options.vram_headroom_bytes : tuner::default_vram_headroom_bytes();
+        const tuner::FitEstimate fit = tuner::estimate_fit(model_info->size_bytes, gguf.metadata, context_length, hw,
+                                                            headroom_for_estimate);
+        if (fit.is_problem()) {
+            std::cerr << "\nWARNING: " << fit.explanation << "\n"
+                      << "Tuning will run anyway -- this is an estimate, not a measurement, and estimates can be wrong.\n"
+                      << "If every configuration fails, this is why.\n\n";
+        } else {
+            std::cout << "Fit estimate: " << fit.explanation << "\n";
+        }
+    }
+    options.idle_timeout = std::chrono::seconds(idle_timeout_seconds);
     options.search_repetitions = std::max(1u, search_repetitions);
     options.context_length = context_length;
     std::cout << "Tuning and serving at context size " << context_length
               << " tokens (override with --context; this is what llama-bench is benchmarked against via -d, and what "
                  "run/serve will launch llama-cli/llama-server with via -c).\n";
+    options.on_rejected = [](const tuner::BenchmarkResult& result) {
+        if (result.vram_headroom_exceeded) {
+            std::cout << "    ^ rejected: fast, but leaves no VRAM headroom -- it would fit this machine while idle,\n"
+                         "      not while you are using it. Keeping the last configuration with margin.\n";
+        } else {
+            std::cout << "    ^ rejected: VRAM full and throughput collapsed -- silent spill to system RAM, not a usable\n"
+                         "      configuration. Nothing beyond this point will be tried.\n";
+        }
+    };
     options.on_result = [](const tuner::BenchmarkResult& result) {
         std::cout << "  [" << result.config.label << "] ";
         if (result.oom) {
@@ -220,12 +384,25 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
         } else if (result.crashed) {
             std::cout << "crashed (exit " << result.exit_code << ")\n";
         } else if (result.timed_out) {
-            std::cout << "timed out\n";
+            // Which limit fired matters when reading a search afterwards:
+            // "idle" means the process went silent (stalled -- on Windows
+            // typically an over-VRAM allocation), "total" means it was
+            // working the whole time and simply too slow.
+            std::cout << "timed out (" << (result.idle_timed_out ? "went silent" : "exceeded total budget") << ")\n";
         } else if (!result.output_valid) {
             std::cout << "invalid output\n";
         } else {
             std::cout << "prompt=" << result.prompt_tokens_per_second << " tok/s, gen=" << result.generation_tokens_per_second
-                       << " tok/s, score=" << result.score << "\n";
+                       << " tok/s, score=" << result.score;
+            // The VRAM peak is what the spill guard reasons about. Printing
+            // it makes both a rejected candidate and a suspiciously slow one
+            // explainable from the log alone.
+            if (result.measured_peak_vram_bytes) {
+                std::cout << ", VRAM peak=" << format_gib(*result.measured_peak_vram_bytes);
+            } else {
+                std::cout << ", VRAM peak=unmeasured";
+            }
+            std::cout << "\n";
         }
     };
 
@@ -250,23 +427,34 @@ int cmd_tune(const std::string& model_path_str, const std::string& llama_dir_opt
     profile.best_config.ubatch_size = best.config.ubatch_size;
     profile.best_config.kv_cache_type = best.config.kv_cache_type;
     profile.best_config.context_length = context_length;
+    profile.best_config.n_cpu_moe = outcome.best->config.n_cpu_moe;
     profile.results.prompt_tps = best.prompt_tokens_per_second;
     profile.results.generation_tps = best.generation_tokens_per_second;
     profile.results.duration_ms = best.duration.count();
     profile.results.score = best.score;
 
+    // Print the result *before* trying to persist it. If saving fails, the
+    // configuration the search just spent tens of minutes finding is still on
+    // screen, and can be re-entered by hand rather than lost.
+    std::cout << "\nBest configuration: " << best.config.label << "\n";
+    std::cout << "  threads=" << best.config.threads << " gpu_layers=" << best.config.gpu_layers
+               << " batch=" << best.config.batch_size << " ubatch=" << best.config.ubatch_size;
+    if (profile.best_config.n_cpu_moe) {
+        std::cout << " n_cpu_moe=" << *profile.best_config.n_cpu_moe;
+    }
+    std::cout << " context=" << context_length << "\n";
+    std::cout << "  prompt=" << best.prompt_tokens_per_second << " tok/s, generation=" << best.generation_tokens_per_second
+               << " tok/s, score=" << best.score << "\n";
+
     profiles::ProfileStore store(profiles_dir_opt);
     std::string save_error;
     if (!store.save(profile, &save_error)) {
-        std::cerr << "error: could not save profile: " << save_error << "\n";
+        std::cerr << "\nerror: could not save profile: " << save_error << "\n"
+                  << "\nThe configuration above is the result of this run -- it is not lost, only unsaved.\n"
+                  << "Re-run with --profiles-dir pointing somewhere writable to save it without tuning again.\n";
         return 1;
     }
 
-    std::cout << "\nBest configuration: " << best.config.label << "\n";
-    std::cout << "  threads=" << best.config.threads << " gpu_layers=" << best.config.gpu_layers
-               << " batch=" << best.config.batch_size << " ubatch=" << best.config.ubatch_size << "\n";
-    std::cout << "  prompt=" << best.prompt_tokens_per_second << " tok/s, generation=" << best.generation_tokens_per_second
-               << " tok/s, score=" << best.score << "\n";
     std::cout << "Profile saved to " << store.profile_path_for(profile.model).string() << "\n";
 
     if (compare_repeats > 0) {
@@ -375,6 +563,12 @@ std::vector<std::string> build_config_arguments(const profiles::Profile& profile
     if (profile.best_config.context_length > 0) {
         add_if_supported("--ctx-size", "-c", std::to_string(profile.best_config.context_length));
     }
+    // MoE expert placement, replayed exactly as benchmarked. Paired with
+    // -ngl above, which the tuner set to the model's full layer count for
+    // these models.
+    if (profile.best_config.n_cpu_moe) {
+        add_if_supported("--n-cpu-moe", "--n-cpu-moe", std::to_string(*profile.best_config.n_cpu_moe));
+    }
     if (profile.best_config.kv_cache_type) {
         if (llama::supports_flag(supported_flags, "--cache-type-k")) {
             args.push_back("-ctk");
@@ -387,6 +581,20 @@ std::vector<std::string> build_config_arguments(const profiles::Profile& profile
     }
 
     return args;
+}
+
+// Applies the arguments the user passed after `--`, letting them replace the
+// corresponding profile-derived flags instead of being appended alongside
+// them, and reports on stderr which profile values were overridden so the
+// launch line stays explainable.
+std::vector<std::string> apply_user_overrides(std::vector<std::string> profile_args,
+                                               const std::vector<std::string>& user_args) {
+    std::vector<std::string> overridden;
+    std::vector<std::string> merged = llama::merge_user_overrides(profile_args, user_args, &overridden);
+    if (!overridden.empty()) {
+        std::cerr << "note: user arguments override profile value(s) for: " << join(overridden, ", ") << "\n";
+    }
+    return merged;
 }
 
 // ---------------------------------------------------------------------
@@ -408,7 +616,7 @@ int cmd_run(const std::string& model_path_str, const std::string& llama_dir_opt,
 
     std::set<std::string> supported_flags = llama::detect_supported_flags(*binaries.llama_cli);
     std::vector<std::string> args = build_config_arguments(profile, supported_flags, model_path);
-    args.insert(args.end(), extra_args.begin(), extra_args.end());
+    args = apply_user_overrides(std::move(args), extra_args);
 
     std::cout << "Launching: " << binaries.llama_cli->string() << " " << join(args, " ") << "\n";
 
@@ -455,7 +663,7 @@ int cmd_serve(const std::string& model_path_str, const std::string& llama_dir_op
         args.push_back("--port");
         args.push_back(std::to_string(port));
     }
-    args.insert(args.end(), extra_args.begin(), extra_args.end());
+    args = apply_user_overrides(std::move(args), extra_args);
 
     std::cout << "Starting llama-server on http://" << host << ":" << port << "\n";
     std::cout << "Launching: " << binaries.llama_server->string() << " " << join(args, " ") << "\n";
@@ -495,14 +703,29 @@ int main(int argc, char** argv) {
 
     std::string tune_model;
     unsigned tune_timeout_seconds = 60;
+    unsigned tune_idle_timeout_seconds = 60;
+    bool no_moe_tune = false;
+    unsigned vram_headroom_mb = 0;
     unsigned search_repetitions = 3;
     unsigned context_length = 4096;
     unsigned compare_repeats = 0;
     unsigned warmup_runs = 1;
     std::string report_out;
+    CLI::App* menu_cmd = app.add_subcommand("menu", "Interactive menu: pick a model and an action without typing flags");
+    add_common_options(menu_cmd);
+
+    CLI::App* doctor_cmd = app.add_subcommand("doctor", "Diagnose the llama.cpp build, its capabilities and the GPU setup");
+    add_common_options(doctor_cmd);
+
     CLI::App* tune_cmd = app.add_subcommand("tune", "Benchmark and select the best llama.cpp configuration for a model");
     tune_cmd->add_option("model", tune_model, "Path to a .gguf model file")->required();
-    tune_cmd->add_option("--timeout", tune_timeout_seconds, "Per-benchmark timeout in seconds (per llama-bench repetition)")
+    tune_cmd->add_option("--vram-headroom-mb", vram_headroom_mb,
+                          "VRAM (MB) to leave free when estimating how many layers fit (0 = platform default)");
+    tune_cmd->add_flag("--no-moe-tune", no_moe_tune,
+                        "Skip the MoE expert-placement search and tune this model as if it were dense");
+    tune_cmd->add_option("--idle-timeout", tune_idle_timeout_seconds,
+                          "Give up on a benchmark that produces no output for this many seconds (0 = never)");
+    tune_cmd->add_option("--timeout", tune_timeout_seconds, "Minimum per-benchmark time budget in seconds (per repetition; scaled up automatically for large models)")
         ->default_val(60);
     tune_cmd
         ->add_option("--search-repetitions", search_repetitions,
@@ -548,12 +771,44 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (*menu_cmd) {
+        const std::filesystem::path profiles_path =
+            profiles_dir_opt.empty() ? std::filesystem::path("profiles") : std::filesystem::path(profiles_dir_opt);
+        // Loop so that actions which are meant to be repeatable -- doctor --
+        // return to the menu instead of ending the program. Tune and serve
+        // are terminal: they hand control to a long-running llama.cpp
+        // process, so they exit the loop.
+        for (;;) {
+            const menu::MenuAction action = menu::run_menu(profiles_path);
+            switch (action.kind) {
+            case menu::MenuAction::Kind::Tune:
+                return cmd_tune(action.model.string(), llama_dir_opt, profiles_dir_opt, tune_timeout_seconds,
+                                 search_repetitions, static_cast<unsigned>(std::stoul(action.context)),
+                                 static_cast<unsigned>(std::stoul(action.compare_repeats)),
+                                 static_cast<unsigned>(std::stoul(action.vram_headroom_mb)), tune_idle_timeout_seconds,
+                                 no_moe_tune, warmup_runs, action.report_out);
+            case menu::MenuAction::Kind::Serve:
+                return cmd_serve(action.model.string(), llama_dir_opt, profiles_dir_opt, serve_host, serve_port,
+                                  action.extra_args);
+            case menu::MenuAction::Kind::Doctor:
+                cmd_doctor(llama_dir_opt);
+                std::cout << "\n";
+                continue; // back to the menu
+            case menu::MenuAction::Kind::None:
+                return 0;
+            }
+        }
+    }
+    if (*doctor_cmd) {
+        return cmd_doctor(llama_dir_opt);
+    }
     if (*inspect_cmd) {
         return cmd_inspect(llama_dir_opt);
     }
     if (*tune_cmd) {
         return cmd_tune(tune_model, llama_dir_opt, profiles_dir_opt, tune_timeout_seconds, search_repetitions,
-                         context_length, compare_repeats, warmup_runs, report_out);
+                         context_length, compare_repeats, vram_headroom_mb, tune_idle_timeout_seconds, no_moe_tune,
+                         warmup_runs, report_out);
     }
     if (*run_cmd) {
         return cmd_run(run_model, llama_dir_opt, profiles_dir_opt, run_extra_args);

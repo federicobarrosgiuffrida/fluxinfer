@@ -36,6 +36,7 @@ using nvmlDeviceGetCount_v2_t = nvmlReturn_t (*)(unsigned int*);
 using nvmlDeviceGetHandleByIndex_v2_t = nvmlReturn_t (*)(unsigned int, nvmlDevice_t*);
 using nvmlDeviceGetName_t = nvmlReturn_t (*)(nvmlDevice_t, char*, unsigned int);
 using nvmlDeviceGetMemoryInfo_t = nvmlReturn_t (*)(nvmlDevice_t, nvmlMemory_t*);
+using nvmlDeviceGetCudaComputeCapability_t = nvmlReturn_t (*)(nvmlDevice_t, int*, int*);
 
 } // extern "C"
 

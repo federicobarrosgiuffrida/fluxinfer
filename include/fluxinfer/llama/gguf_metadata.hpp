@@ -23,6 +23,14 @@ struct GgufMetadata {
     std::optional<std::uint64_t> expert_count;        // <arch>.expert_count
     std::optional<std::uint64_t> expert_used_count;   // <arch>.expert_used_count
 
+    // Attention head counts, needed to size the KV cache. head_count_kv is
+    // smaller than head_count on models using grouped-query attention,
+    // which is most modern ones -- assuming they are equal overestimates
+    // the cache by the GQA ratio (commonly 4-8x), enough to turn a fit
+    // estimate into nonsense.
+    std::optional<std::uint64_t> attention_head_count;     // <arch>.attention.head_count
+    std::optional<std::uint64_t> attention_head_count_kv;  // <arch>.attention.head_count_kv
+
     std::optional<std::int64_t> file_type; // general.file_type (llama.cpp quantization enum)
     std::string quantization_label;        // best-effort human label derived from file_type
 };

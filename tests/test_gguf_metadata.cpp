@@ -112,6 +112,8 @@ TEST_CASE("parses a minimal valid fixture with qwen-style architecture keys", "[
     b.add_u32("testarch.block_count", 32);
     b.add_u32("testarch.context_length", 4096);
     b.add_u32("testarch.embedding_length", 2048);
+    b.add_u32("testarch.attention.head_count", 16);
+    b.add_u32("testarch.attention.head_count_kv", 4);
     b.add_i32("general.file_type", 15);
 
     GgufParseResult result = parse(b.build());
@@ -126,6 +128,11 @@ TEST_CASE("parses a minimal valid fixture with qwen-style architecture keys", "[
     CHECK(result.metadata.context_length.value() == 4096);
     REQUIRE(result.metadata.embedding_length.has_value());
     CHECK(result.metadata.embedding_length.value() == 2048);
+    // Grouped-query attention: fewer KV heads than query heads.
+    REQUIRE(result.metadata.attention_head_count.has_value());
+    CHECK(result.metadata.attention_head_count.value() == 16);
+    REQUIRE(result.metadata.attention_head_count_kv.has_value());
+    CHECK(result.metadata.attention_head_count_kv.value() == 4);
     REQUIRE(result.metadata.file_type.has_value());
     CHECK(result.metadata.file_type.value() == 15);
     CHECK(result.metadata.quantization_label == "Q4_K_M");
@@ -394,4 +401,20 @@ TEST_CASE("describe_file_type maps known values and reports unknown ones honestl
     CHECK(describe_file_type(15) == "Q4_K_M");
     CHECK(describe_file_type(0) == "F32");
     CHECK(describe_file_type(9999).find("unknown") != std::string::npos);
+}
+
+TEST_CASE("attention head counts are absent rather than guessed when the model omits them", "[gguf]") {
+    GgufBuilder b;
+    b.add_string("general.architecture", "testarch");
+    b.add_u32("testarch.block_count", 24);
+    b.add_u32("testarch.embedding_length", 1024);
+    // No attention.* keys at all.
+
+    const std::string bytes = b.build();
+    std::istringstream stream(bytes);
+    GgufParseResult result = parse_gguf_metadata(stream, bytes.size());
+
+    REQUIRE(result.valid);
+    CHECK_FALSE(result.metadata.attention_head_count.has_value());
+    CHECK_FALSE(result.metadata.attention_head_count_kv.has_value());
 }

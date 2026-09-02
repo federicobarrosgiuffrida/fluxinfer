@@ -1,5 +1,8 @@
 #include "fluxinfer/process/process_runner.hpp"
 
+#include <atomic>
+#include <chrono>
+
 #include "line_buffer.hpp"
 
 #include <windows.h>
@@ -147,8 +150,12 @@ bool make_inheritable_output_pipe(PipeHandles& pipe) {
 
 class ReaderThread {
 public:
-    ReaderThread(HANDLE handle, std::string* out, std::function<void(std::string_view)> on_line)
-        : handle_(handle), out_(out), on_line_(std::move(on_line)) {
+    // `activity` is bumped on every chunk read, so the waiting thread can
+    // tell "child is still producing output" from "child has gone silent"
+    // without needing to inspect the (concurrently appended) buffers.
+    ReaderThread(HANDLE handle, std::string* out, std::function<void(std::string_view)> on_line,
+                 std::atomic<unsigned long long>* activity = nullptr)
+        : handle_(handle), out_(out), on_line_(std::move(on_line)), activity_(activity) {
         thread_ = std::thread([this] { run(); });
     }
 
@@ -166,6 +173,9 @@ private:
         while (ReadFile(handle_, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr) &&
                bytes_read > 0) {
             out_->append(buffer.data(), bytes_read);
+            if (activity_ != nullptr) {
+                activity_->fetch_add(1, std::memory_order_relaxed);
+            }
             detail::feed_lines(pending, std::string_view(buffer.data(), bytes_read), on_line_);
         }
         detail::flush_pending_line(pending, on_line_);
@@ -174,6 +184,7 @@ private:
     HANDLE handle_;
     std::string* out_;
     std::function<void(std::string_view)> on_line_;
+    std::atomic<unsigned long long>* activity_ = nullptr;
     std::thread thread_;
 };
 
@@ -281,16 +292,50 @@ ProcessResult run_captured(const ProcessOptions& options) {
     CloseHandle(pi.hThread);
 
     {
-        ReaderThread stdout_reader(stdout_pipe.read, &result.stdout_data, options.on_stdout_line);
-        ReaderThread stderr_reader(stderr_pipe.read, &result.stderr_data, options.on_stderr_line);
+        std::atomic<unsigned long long> activity{0};
+        ReaderThread stdout_reader(stdout_pipe.read, &result.stdout_data, options.on_stdout_line, &activity);
+        ReaderThread stderr_reader(stderr_pipe.read, &result.stderr_data, options.on_stderr_line, &activity);
 
-        DWORD wait_ms = options.timeout ? static_cast<DWORD>(options.timeout->count()) : INFINITE;
-        DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_ms);
+        bool timed_out = false;
+        bool idle_timed_out = false;
+        if (!options.idle_timeout) {
+            // No idle limit: single blocking wait, exactly as before.
+            const DWORD wait_ms = options.timeout ? static_cast<DWORD>(options.timeout->count()) : INFINITE;
+            timed_out = WaitForSingleObject(pi.hProcess, wait_ms) == WAIT_TIMEOUT;
+        } else {
+            // Wait in slices so output activity can be observed between
+            // them; the child is only killed once it has been silent for
+            // the whole idle window (or has blown the total limit).
+            constexpr DWORD kSliceMs = 250;
+            auto last_activity = std::chrono::steady_clock::now();
+            unsigned long long last_seen = activity.load(std::memory_order_relaxed);
+            for (;;) {
+                if (WaitForSingleObject(pi.hProcess, kSliceMs) != WAIT_TIMEOUT) {
+                    break; // child exited on its own
+                }
+                const auto now = std::chrono::steady_clock::now();
+                const unsigned long long seen = activity.load(std::memory_order_relaxed);
+                if (seen != last_seen) {
+                    last_seen = seen;
+                    last_activity = now;
+                }
+                if (now - last_activity >= *options.idle_timeout) {
+                    timed_out = true;
+                    idle_timed_out = true;
+                    break;
+                }
+                if (options.timeout && (now - start_time) >= *options.timeout) {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
 
-        if (wait_result == WAIT_TIMEOUT) {
+        if (timed_out) {
             TerminateProcess(pi.hProcess, 1);
             WaitForSingleObject(pi.hProcess, 5000);
             result.outcome = ProcessOutcome::TimedOut;
+            result.idle_timed_out = idle_timed_out;
         } else {
             result.outcome = ProcessOutcome::Exited;
         }

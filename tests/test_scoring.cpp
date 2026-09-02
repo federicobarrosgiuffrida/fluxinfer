@@ -102,3 +102,90 @@ TEST_CASE("compute_score applies the memory pressure penalty with the configured
 
     CHECK(compute_score(result, 16 * kGiB, 0, weights) == Catch::Approx(expected));
 }
+
+namespace {
+constexpr std::uint64_t kMiB = 1024ULL * 1024;
+
+// Shaped after the real RTX 3060 12GB / Qwen3.6-35B-A3B sweep recorded in
+// docs/: each entry is a usable run with a measured VRAM peak.
+BenchmarkResult make_run(double prompt_tps, double generation_tps, std::uint64_t peak_mib) {
+    BenchmarkResult result;
+    result.ran = true;
+    result.exit_code = 0;
+    result.output_valid = true;
+    result.prompt_tokens_per_second = prompt_tps;
+    result.generation_tokens_per_second = generation_tps;
+    result.measured_peak_vram_bytes = peak_mib * kMiB;
+    return result;
+}
+
+constexpr std::uint64_t kTotalVram = 12288 * kMiB; // RTX 3060 12GB
+constexpr std::uint64_t kHeadroom = 1536 * kMiB;   // Windows default
+} // namespace
+
+TEST_CASE("looks_like_vram_spill flags the measured silent-spill case", "[scoring][spill]") {
+    // Real numbers: the setting that left ~260MB free ran at 77 tok/s
+    // prompt / 28.4 tok/s generation, against 654 / 45.4 one step lower.
+    const BenchmarkResult healthy = make_run(654.0, 45.4, 11235);
+    const BenchmarkResult spilling = make_run(77.0, 28.4, 12026);
+
+    CHECK(looks_like_vram_spill(spilling, healthy, kTotalVram, kHeadroom));
+}
+
+TEST_CASE("looks_like_vram_spill does not flag healthy configurations", "[scoring][spill]") {
+    SECTION("normal improvement as more work moves to the GPU") {
+        const BenchmarkResult slower = make_run(202.0, 33.6, 5724);
+        const BenchmarkResult faster = make_run(519.0, 37.4, 7585);
+        CHECK_FALSE(looks_like_vram_spill(faster, slower, kTotalVram, kHeadroom));
+    }
+
+    SECTION("slower run with plenty of VRAM left is not a spill") {
+        // Whatever made this configuration slower, it was not the card
+        // running out of room -- over 6GB was still free.
+        const BenchmarkResult reference = make_run(600.0, 45.0, 5724);
+        const BenchmarkResult slow = make_run(60.0, 10.0, 5900);
+        CHECK_FALSE(looks_like_vram_spill(slow, reference, kTotalVram, kHeadroom));
+    }
+
+    SECTION("full card but only a mild slowdown is not a spill") {
+        const BenchmarkResult reference = make_run(600.0, 45.0, 11235);
+        const BenchmarkResult mild = make_run(560.0, 41.0, 12026);
+        CHECK_FALSE(looks_like_vram_spill(mild, reference, kTotalVram, kHeadroom));
+    }
+
+    SECTION("without a VRAM measurement no accusation is made") {
+        BenchmarkResult unmeasured = make_run(77.0, 28.4, 12026);
+        unmeasured.measured_peak_vram_bytes.reset();
+        const BenchmarkResult healthy = make_run(654.0, 45.4, 11235);
+        CHECK_FALSE(looks_like_vram_spill(unmeasured, healthy, kTotalVram, kHeadroom));
+    }
+
+    SECTION("a crashed or OOM run is handled by its own detection, not this") {
+        BenchmarkResult crashed = make_run(0.0, 0.0, 12026);
+        crashed.crashed = true;
+        const BenchmarkResult healthy = make_run(654.0, 45.4, 11235);
+        CHECK_FALSE(looks_like_vram_spill(crashed, healthy, kTotalVram, kHeadroom));
+    }
+}
+
+TEST_CASE("exceeds_vram_headroom rejects configurations with no margin", "[scoring][spill]") {
+    // Real case: --n-cpu-moe 21 peaked at 12.0GB of a 12GB card during the
+    // search, benchmarked fastest, and then served ~10% slower than a
+    // configuration with margin once the machine was actually in use.
+    CHECK(exceeds_vram_headroom(make_run(138.7, 38.7, 12280), kTotalVram, kHeadroom));
+
+    SECTION("a configuration with margin is accepted") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(136.5, 37.9, 10500), kTotalVram, kHeadroom));
+    }
+    SECTION("exactly at the headroom boundary is still acceptable") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(136.5, 37.9, 12288 - 1536), kTotalVram, kHeadroom));
+    }
+    SECTION("no measurement means no verdict") {
+        BenchmarkResult unmeasured = make_run(138.7, 38.7, 12280);
+        unmeasured.measured_peak_vram_bytes.reset();
+        CHECK_FALSE(exceeds_vram_headroom(unmeasured, kTotalVram, kHeadroom));
+    }
+    SECTION("headroom disabled means no verdict") {
+        CHECK_FALSE(exceeds_vram_headroom(make_run(138.7, 38.7, 12280), kTotalVram, 0));
+    }
+}

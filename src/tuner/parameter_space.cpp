@@ -2,9 +2,24 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <set>
 
 namespace fluxinfer::tuner {
+
+std::uint64_t default_vram_headroom_bytes() {
+    constexpr std::uint64_t kMiB = 1024ULL * 1024;
+#if defined(_WIN32)
+    // Measured on an RTX 3060 12GB running a 21GB MoE model: with ~300MB
+    // free, generation and prompt throughput dropped to a fraction of the
+    // next-lower offload setting while llama.cpp still reported success and
+    // no CUDA OOM -- the WDDM driver had silently started spilling to
+    // system RAM. Leaving ~1.5GB unused avoided that regime entirely.
+    return 1536 * kMiB;
+#else
+    return 1024 * kMiB;
+#endif
+}
 
 TuneConfig baseline_config(const ParameterSpaceInput& input) {
     TuneConfig config;
@@ -39,10 +54,67 @@ std::vector<TuneConfig> gpu_layers_candidates(const ParameterSpaceInput& input, 
     layer_values.insert(0);
     layer_values.insert(total_layers);
 
+    // Seed one extra candidate where the weights are actually expected to
+    // fit. The fixed percentiles above can straddle the real boundary badly
+    // (on a 12GB card with a 21GB model, 50% is already far past it and 25%
+    // far short), which wastes probes and leaves the binary-search
+    // refinement to do all the work from a poor starting bracket.
+    const std::uint64_t headroom =
+        input.vram_headroom_bytes > 0 ? input.vram_headroom_bytes : default_vram_headroom_bytes();
+    const std::uint64_t vram = input.hardware.gpu.available_vram_bytes;
+    if (input.model_size_bytes > 0 && vram > headroom) {
+        const double bytes_per_layer = static_cast<double>(input.model_size_bytes) / static_cast<double>(total_layers);
+        if (bytes_per_layer > 0.0) {
+            const auto fitting = static_cast<std::int64_t>(static_cast<double>(vram - headroom) / bytes_per_layer);
+            layer_values.insert(std::clamp<std::int64_t>(fitting, 0, total_layers));
+        }
+    }
+
     for (std::int64_t layers : layer_values) {
         TuneConfig config = base;
         config.gpu_layers = static_cast<int>(layers);
         config.label = "gpu_layers=" + std::to_string(layers);
+        candidates.push_back(config);
+    }
+    return candidates;
+}
+
+bool is_moe_tunable(const ParameterSpaceInput& input) {
+    if (!input.hardware.gpu.available || !input.expert_count || *input.expert_count <= 1) {
+        return false;
+    }
+    if (!input.real_layer_count || *input.real_layer_count == 0) {
+        return false;
+    }
+    // No point generating candidates a llama-bench that predates the flag
+    // would reject; the caller falls back to the dense search instead.
+    return input.supported_flags.count("--n-cpu-moe") != 0;
+}
+
+std::vector<TuneConfig> n_cpu_moe_candidates(const ParameterSpaceInput& input, const TuneConfig& base) {
+    std::vector<TuneConfig> candidates;
+    if (!is_moe_tunable(input)) {
+        return candidates;
+    }
+
+    const auto total_layers = static_cast<std::int64_t>(*input.real_layer_count);
+
+    std::set<std::int64_t, std::greater<std::int64_t>> values; // descending: safest first
+    for (int pct : {100, 75, 50, 25, 0}) {
+        std::int64_t layers_on_cpu = static_cast<std::int64_t>(std::llround(total_layers * (pct / 100.0)));
+        values.insert(std::clamp<std::int64_t>(layers_on_cpu, 0, total_layers));
+    }
+    values.insert(total_layers);
+    values.insert(0);
+
+    for (std::int64_t layers_on_cpu : values) {
+        TuneConfig config = base;
+        // Everything that is not an expert tensor goes to the GPU; the
+        // experts are then placed by --n-cpu-moe. Mirrors the manual
+        // `-ngl 99 --n-cpu-moe N` recipe this stage automates.
+        config.gpu_layers = static_cast<int>(total_layers);
+        config.n_cpu_moe = static_cast<int>(layers_on_cpu);
+        config.label = "n_cpu_moe=" + std::to_string(layers_on_cpu);
         candidates.push_back(config);
     }
     return candidates;

@@ -26,6 +26,26 @@ std::set<std::string> detect_supported_flags(const std::filesystem::path& binary
 // detect_supported_flags().
 bool supports_flag(const std::set<std::string>& supported_flags, const std::string& flag);
 
+// Merges FluxInfer's profile-derived argv with raw user arguments passed
+// after `--` on the command line.
+//
+// `profile_args` is what build_config_arguments() produces: a sequence of
+// [flag, value] pairs. Any flag the user also specifies is dropped from the
+// profile side, so the user's value ends up alone on the final command line
+// instead of being appended after FluxInfer's. llama.cpp does resolve such
+// duplicates by "last one wins", but it prints a DEPRECATED warning and the
+// effective configuration becomes hard to read back from the launch log.
+//
+// Both spellings of an option are treated as the same flag (a user passing
+// `-ngl 99` also overrides a profile's `--n-gpu-layers`), as is `--flag=value`
+// syntax.
+//
+// If `overridden_out` is non-null, it receives the profile flag tokens that
+// were dropped, in the order they appeared, so callers can report them.
+std::vector<std::string> merge_user_overrides(const std::vector<std::string>& profile_args,
+                                               const std::vector<std::string>& user_args,
+                                               std::vector<std::string>* overridden_out = nullptr);
+
 // Best-effort extraction of a version/build string from `llama-bench
 // --version` or, failing that, `--help` output. Returns "unknown" if
 // nothing could be determined.
@@ -45,14 +65,24 @@ struct LlamaRunResult {
     bool crashed = false;
     bool timed_out = false;
 
+    // Only meaningful when timed_out: true if the process was killed for
+    // producing no output at all (a real hang), false if it was still
+    // working but exceeded its total budget. Loading a multi-gigabyte model
+    // is slow but not silent, so this separates "stuck" from "big".
+    bool idle_timed_out = false;
+
     bool usable() const { return outcome == process::ProcessOutcome::Exited && !likely_oom && !crashed && exit_code == 0; }
 };
 
 // Invokes `binary` with `arguments` (argv, never shell-interpreted),
 // capturing output and classifying OOM / crash / timeout conditions.
+// `timeout` is the hard cap on total run time. `idle_timeout` (zero =
+// disabled) additionally kills the process if it goes completely silent for
+// that long, which is what a genuine hang looks like.
 LlamaRunResult run_llama_binary(const std::filesystem::path& binary,
                                  const std::vector<std::string>& arguments,
-                                 std::chrono::milliseconds timeout);
+                                 std::chrono::milliseconds timeout,
+                                 std::chrono::milliseconds idle_timeout = std::chrono::milliseconds::zero());
 
 // True if `combined_output` (stdout+stderr) contains a substring typical of
 // a CUDA/host out-of-memory failure. Exposed for unit testing; used

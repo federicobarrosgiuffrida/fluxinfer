@@ -1,6 +1,10 @@
 # MoE VRAM/RAM placement for FluxInfer — research and design
 
-**Status:** research + design, not yet implemented. **Scope:** how FluxInfer
+**Status:** Phase A (the cross-platform static `--n-cpu-moe` search
+described in §2A and §4) is implemented as of 0.4.0 — see
+`n_cpu_moe_candidates()` in `src/tuner/parameter_space.cpp` and the MoE
+stage in `Tuner::run()`. Phase B (eBPF-informed layer selection, Linux
+only) and the dynamic-cache orchestration remain research only. **Scope:** how FluxInfer
 could make very large MoE models (e.g. Qwen3.6-35B-A3B) more usable on
 consumer 8GB-class GPUs by tuning where expert weights live, without
 changing FluxInfer's identity as a wrapper/benchmarker/profile manager

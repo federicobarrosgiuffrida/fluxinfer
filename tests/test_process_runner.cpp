@@ -140,3 +140,54 @@ TEST_CASE("run_llama_binary + parse_llama_bench_output parse a simulated success
     CHECK(parsed.prompt_tokens_per_second.value() == Catch::Approx(1234.5));
     CHECK(parsed.generation_tokens_per_second.value() == Catch::Approx(45.6));
 }
+
+TEST_CASE("idle timeout kills a silent process but spares a slow, talking one", "[process]") {
+    SECTION("silent child is killed once the idle window elapses") {
+        ProcessOptions options;
+        options.executable = g_fluxinfer_test_self_path;
+        options.arguments = {"--fluxinfer-sleep-ms", "5000"};
+        options.timeout = std::chrono::seconds(30); // generous: the idle limit must be what fires
+        options.idle_timeout = std::chrono::milliseconds(400);
+
+        const auto start = std::chrono::steady_clock::now();
+        ProcessResult result = run_captured(options);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        CHECK(result.outcome == ProcessOutcome::TimedOut);
+        CHECK(result.idle_timed_out);
+        CHECK(elapsed < std::chrono::seconds(4));
+    }
+
+    SECTION("child that keeps producing output survives a shorter idle window") {
+        // Talks every 100ms for ~1.2s with a 600ms idle window: it must run
+        // to completion, because it is never silent for that long. This is
+        // the case that mattered in practice -- a large model being loaded
+        // is slow but not stuck.
+        ProcessOptions options;
+        options.executable = g_fluxinfer_test_self_path;
+        options.arguments = {"--fluxinfer-chatty-ms", "1200", "100"};
+        options.timeout = std::chrono::seconds(30);
+        options.idle_timeout = std::chrono::milliseconds(600);
+
+        ProcessResult result = run_captured(options);
+
+        CHECK(result.outcome == ProcessOutcome::Exited);
+        CHECK(result.exit_code == 0);
+        CHECK_FALSE(result.idle_timed_out);
+        CHECK(result.stdout_data.find("still working") != std::string::npos);
+    }
+
+    SECTION("total cap still applies to a talkative child") {
+        ProcessOptions options;
+        options.executable = g_fluxinfer_test_self_path;
+        options.arguments = {"--fluxinfer-chatty-ms", "10000", "50"};
+        options.timeout = std::chrono::milliseconds(700);
+        options.idle_timeout = std::chrono::seconds(10);
+
+        ProcessResult result = run_captured(options);
+
+        CHECK(result.outcome == ProcessOutcome::TimedOut);
+        // Killed by the total budget, not for being silent.
+        CHECK_FALSE(result.idle_timed_out);
+    }
+}

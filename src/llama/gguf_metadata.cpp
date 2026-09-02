@@ -451,6 +451,8 @@ GgufParseResult parse_gguf_metadata(std::istream& stream, std::uint64_t stream_s
         result.metadata.block_count = find_uint(prefix + "block_count");
         result.metadata.context_length = find_uint(prefix + "context_length");
         result.metadata.embedding_length = find_uint(prefix + "embedding_length");
+        result.metadata.attention_head_count = find_uint(prefix + "attention.head_count");
+        result.metadata.attention_head_count_kv = find_uint(prefix + "attention.head_count_kv");
         result.metadata.expert_count = find_uint(prefix + "expert_count");
         result.metadata.expert_used_count = find_uint(prefix + "expert_used_count");
     }

@@ -10,7 +10,10 @@ HardwareInfo probe_hardware() {
     HardwareInfo info;
     info.cpu = probe_cpu();
     info.memory = probe_memory();
-    info.gpu = probe_gpu();
+    // One NVML pass for both fields: probe_gpus() enumerates every device,
+    // and the primary one keeps the exact meaning it had before.
+    info.gpus = probe_gpus();
+    info.gpu = info.gpus.empty() ? probe_gpu() : info.gpus.front();
     return info;
 }
 
